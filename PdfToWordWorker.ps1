@@ -77,7 +77,18 @@ function Get-JsonValue {
 }
 
 function Ensure-WordSession {
-    if ($script:Session -and $script:Session.Word) { return $script:Session }
+    if ($script:Session -and $script:Session.Word) {
+        $wordPid = $script:Session.Pid
+        if (-not $wordPid -or (Get-Process -Id $wordPid -ErrorAction SilentlyContinue)) {
+            return $script:Session
+        }
+
+        # Word died between two jobs (crash, antivirus, manual kill). Reusing the
+        # stale COM object would turn the next conversion into an RPC failure, so
+        # replace it before touching the document.
+        Write-WorkerLog "Word pid $wordPid disappeared between jobs; replacing it."
+        Recycle-WordSession -DelaySeconds 10
+    }
 
     $script:Session = New-WordSession
     if (-not $script:Session.Pid) {

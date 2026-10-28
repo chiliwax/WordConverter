@@ -30,6 +30,7 @@ import os
 import platform
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,16 +38,17 @@ import threading
 import time
 import uuid
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "PdfConverter",
     "ConversionResult",
     "ConversionFailure",
+    "ProgressEvent",
     "BatchResult",
     "PdfToWordError",
     "ValidationError",
@@ -83,6 +85,11 @@ DEFAULT_RECYCLE_AFTER = 50                # jobs per Word instance before a clea
 DEFAULT_RETRIES = 1                       # retries after the first failure
 DEFAULT_STARTUP_TIMEOUT = 180.0           # cold Word start, four workers at once
 IMAGES_FOLDER_SENTINEL = "source_folder"
+
+#: Windows' classic MAX_PATH. At or above this length, conversions are staged in
+#: %TEMP% and the result is moved with the \\?\ long-path prefix. Word itself is
+#: not reliable with long paths, so it never sees one.
+LONG_PATH_THRESHOLD = 250
 
 _HERE = Path(__file__).resolve().parent
 _WORKER_SCRIPT = _HERE / "PdfToWordWorker.ps1"
@@ -171,6 +178,43 @@ class ConversionFailure:
 
     def __str__(self) -> str:
         return f"{self.source.name}: {self.error}"
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """Progress notification emitted by convert() and convert_many().
+
+    ``phase`` is one of:
+
+    * ``"started"`` - a document is about to be converted;
+    * ``"completed"`` - a document converted successfully;
+    * ``"failed"`` - a document failed (including pre-flight validation errors);
+    * ``"finished"`` - the whole batch is over (``convert()`` emits one too).
+
+    For a batch, ``done``/``total`` cover every document, including the ones
+    rejected before Word was touched. ``eta`` is in seconds and is ``None`` while
+    it cannot be estimated. With ``fail_fast=True``, ``cancelled`` counts jobs that
+    were never started.
+    """
+
+    phase: str
+    index: int = 0
+    done: int = 0
+    total: int = 0
+    source: Path | None = None
+    output: Path | None = None
+    result: ConversionResult | None = None
+    failure: ConversionFailure | None = None
+    elapsed: float = 0.0
+    eta: float | None = None
+    workers: int = 0
+    cancelled: int = 0
+
+    @property
+    def percent(self) -> float:
+        if self.total <= 0:
+            return 100.0
+        return min(100.0, 100.0 * self.done / self.total)
 
 
 @dataclass
@@ -274,6 +318,145 @@ def _process_memory_mb(pid: int | None) -> float:
         return counters.WorkingSetSize / (1024 * 1024)
     finally:
         _kernel32.CloseHandle(handle)
+
+
+# ---------------------------------------------------------------------------
+# Windows paths (long-path aware)
+# ---------------------------------------------------------------------------
+
+def _absolute(path: str | os.PathLike[str]) -> Path:
+    """Make a path absolute without touching the filesystem or resolving links."""
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    return Path(os.path.join(os.getcwd(), os.fspath(p)))
+
+
+def _path_key(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.normpath(os.fspath(_absolute(path))))
+
+
+def _win_long(path: str | os.PathLike[str]) -> str:
+    """Return an extended-length path (``\\\\?\\...``) for Windows."""
+    text = os.fspath(path)
+    if os.name != "nt":
+        return text
+    if text.startswith("\\\\?\\"):
+        return text
+    if not os.path.isabs(text):
+        text = os.path.abspath(text)
+    if text.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + text[2:]
+    return "\\\\?\\" + text
+
+
+def _strip_long_prefix(text: str) -> str:
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[8:]
+    if text.startswith("\\\\?\\"):
+        return text[4:]
+    return text
+
+
+def _fs_path(path: str | os.PathLike[str]) -> str:
+    """Use the long-path form only when the path is actually long."""
+    text = os.fspath(path)
+    if os.name == "nt" and len(text) >= LONG_PATH_THRESHOLD:
+        return _win_long(text)
+    return text
+
+
+def _exists(path: str | os.PathLike[str]) -> bool:
+    try:
+        os.stat(_fs_path(path))
+        return True
+    except OSError:
+        return False
+
+
+def _is_file(path: str | os.PathLike[str]) -> bool:
+    try:
+        return stat.S_ISREG(os.stat(_fs_path(path)).st_mode)
+    except OSError:
+        return False
+
+
+def _is_dir(path: str | os.PathLike[str]) -> bool:
+    try:
+        return stat.S_ISDIR(os.stat(_fs_path(path)).st_mode)
+    except OSError:
+        return False
+
+
+def _makedirs(path: str | os.PathLike[str]) -> None:
+    os.makedirs(_fs_path(path), exist_ok=True)
+
+
+def _copy_file(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+    shutil.copy2(_fs_path(source), _fs_path(destination))
+
+
+def _move_path(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+    shutil.move(_fs_path(source), _fs_path(destination))
+
+
+def _remove_path(path: str | os.PathLike[str]) -> None:
+    target = _fs_path(path)
+    if not os.path.lexists(target):
+        return
+    if os.path.isdir(target) and not os.path.islink(target):
+        shutil.rmtree(target)
+    else:
+        os.remove(target)
+
+
+def _check_component_length(path: str | os.PathLike[str], label: str) -> None:
+    """Windows still limits a single file/folder name to 255 characters."""
+    if os.name != "nt":
+        return
+    for part in Path(os.fspath(path)).parts:
+        if len(part) > 255:
+            raise ValidationError(
+                f"{label} contains a name longer than 255 characters: {part!r}")
+
+
+def _iter_pdfs(directory: Path, recursive: bool) -> list[Path]:
+    """List PDFs without relying on Path.glob (which is not long-path aware)."""
+    root = _fs_path(directory)
+    found: list[Path] = []
+
+    if recursive:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if name.lower().endswith(".pdf"):
+                    found.append(Path(_strip_long_prefix(os.path.join(dirpath, name))))
+    else:
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if entry.is_file() and entry.name.lower().endswith(".pdf"):
+                        found.append(Path(_strip_long_prefix(entry.path)))
+        except OSError:
+            return []
+
+    return sorted(found, key=lambda item: str(item).lower())
+
+
+def _relative_to(path: Path, root: Path) -> Path | None:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        # Windows paths are case-insensitive; compare normalised strings.
+        raw_path = os.fspath(_absolute(path))
+        raw_root = os.fspath(_absolute(root))
+        folded_path = os.path.normcase(raw_path)
+        folded_root = os.path.normcase(raw_root)
+        if folded_path == folded_root:
+            return Path(".")
+        prefix = folded_root.rstrip("\\/") + os.sep
+        if folded_path.startswith(prefix):
+            return Path(raw_path[len(prefix):])
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -567,15 +750,18 @@ class _Slot:
         attempts = job.retries + 1
 
         for attempt in range(1, attempts + 1):
+            retry_delay = min(2.0 * attempt, 5.0)
             try:
                 worker = self.ensure()
                 response = worker.request(job.payload(), timeout=job.timeout + 120.0)
             except _WorkerTimeout as exc:
                 last_error = exc
                 self.reset(kill=True)
+                retry_delay = 10.0
             except _WorkerCrashed as exc:
                 last_error = exc
                 self.reset(kill=True)
+                retry_delay = 5.0
             except Exception as exc:  # pragma: no cover - defensive
                 last_error = exc
                 self.reset(kill=True)
@@ -596,15 +782,160 @@ class _Slot:
                 else:
                     last_error = WordError(message)
 
+                # 0x800706BE / 0x800706BA / 0x80010108 mean the COM channel died
+                # (Word crashed or was killed). Reusing that PowerShell process
+                # rarely helps, so drop it and start a clean one after a pause.
+                if _is_rpc_failure(message):
+                    _LOG.warning(
+                        "RPC failure from Word (worker %d); restarting it: %s",
+                        self.index, message,
+                    )
+                    self.reset(kill=True)
+                    retry_delay = 10.0
+
             if attempt < attempts:
                 _LOG.warning(
-                    "attempt %d/%d failed for %s: %s - retrying",
-                    attempt, attempts, job.source.name, last_error,
+                    "attempt %d/%d failed for %s: %s - retrying in %.1fs",
+                    attempt, attempts, job.source.name, last_error, retry_delay,
                 )
-                time.sleep(min(2.0 * attempt, 5.0))
+                time.sleep(retry_delay)
 
         assert last_error is not None
         raise last_error
+
+
+_RPC_FAILURE_MARKERS = (
+    "0x800706be",   # RPC_S_CALL_FAILED
+    "0x800706ba",   # RPC_S_SERVER_UNAVAILABLE
+    "0x800706bf",   # RPC_S_CALL_FAILED_DNE
+    "0x80010108",   # RPC_E_DISCONNECTED
+    "0x800401fd",   # CO_E_OBJNOTCONNECTED
+    "0x80010001",   # RPC_E_CALL_REJECTED
+)
+
+
+def _is_rpc_failure(message: str) -> bool:
+    folded = message.lower()
+    return any(marker in folded for marker in _RPC_FAILURE_MARKERS)
+
+
+def _needs_staging(job: _Job) -> bool:
+    """True when Word should work in %TEMP% because a path is too long."""
+    if os.name != "nt":
+        return False
+    if len(os.fspath(job.source)) >= LONG_PATH_THRESHOLD:
+        return True
+    if len(os.fspath(job.output)) >= LONG_PATH_THRESHOLD:
+        return True
+    if job.format in ("html", "htmlfull"):
+        images = job.output.parent / job.images_folder
+        if len(os.fspath(images)) + 40 >= LONG_PATH_THRESHOLD:
+            return True
+    return False
+
+
+def _publish_staged(job: _Job, result: ConversionResult) -> None:
+    """Move a staged result to its final (possibly very long) destination."""
+    _makedirs(job.output.parent)
+
+    if _exists(job.output) and not job.force:
+        raise ValidationError(
+            f"Output already exists: {job.output} - pass force=True to overwrite.")
+
+    moved: list[Path] = []
+    try:
+        # Move sidecars (HTML source_folder) first so the published HTML never
+        # points at a folder that has not been moved yet.
+        for name in result.companion_files:
+            source = result.output.parent / name
+            if not _exists(source):
+                continue
+            destination = job.output.parent / name
+            if _exists(destination):
+                if not job.force:
+                    raise ValidationError(
+                        f"Output companion already exists: {destination} - "
+                        "pass force=True to overwrite.")
+                _remove_path(destination)
+            _move_path(source, destination)
+            moved.append(destination)
+
+        if _exists(job.output):
+            if not job.force:
+                raise ValidationError(
+                    f"Output already exists: {job.output} - pass force=True to overwrite.")
+            _remove_path(job.output)
+
+        _move_path(result.output, job.output)
+    except Exception:
+        # Do not leave a half-published HTML document behind.
+        for path in reversed(moved):
+            try:
+                _remove_path(path)
+            except Exception:  # pragma: no cover - best-effort rollback
+                pass
+        raise
+
+
+def _run_job(slot: _Slot, job: _Job) -> ConversionResult:
+    """Convert one job, staging through %TEMP% when Windows paths are too long."""
+    if not _needs_staging(job):
+        return slot.convert(job)
+
+    staging = Path(tempfile.mkdtemp(prefix="pdf2word-stage-"))
+    _LOG.debug("staging long-path job in %s", staging)
+    try:
+        # Keep the real file names inside the short staging folder: Word then sees
+        # "NFXXX.pdf"/"NFXXX.docx" and cannot leak "input"/"output" into document
+        # metadata. Only a pdf -> pdf conversion can collide with its own source.
+        staged_source = staging / job.source.name
+        staged_output = staging / job.output.name
+        if _path_key(staged_source) == _path_key(staged_output):
+            staged_source = staging / ("source-" + job.source.name)
+
+        _copy_file(job.source, staged_source)
+        staged_job = replace(
+            job, source=staged_source, output=staged_output, force=True
+        )
+        result = slot.convert(staged_job)
+        _publish_staged(job, result)
+        return replace(result, source=job.source, output=job.output)
+    finally:
+        try:
+            _remove_path(staging)
+        except Exception:  # pragma: no cover - cleanup must not mask the result
+            _LOG.warning("could not remove staging folder %s", staging)
+
+
+def _estimate_eta(done: int, total: int, elapsed: float) -> float | None:
+    """Rough remaining time; None until there is something to extrapolate from."""
+    if total <= 0 or done <= 0 or elapsed <= 0:
+        return None
+    remaining = total - done
+    if remaining <= 0:
+        return 0.0
+    return max(0.0, elapsed / done * remaining)
+
+
+def _notify_progress(
+    on_event: Callable[[ProgressEvent], None] | None,
+    on_progress: Callable[[ConversionResult | ConversionFailure], None] | None,
+    event: ProgressEvent,
+) -> None:
+    """Invoke the callbacks without letting a broken one kill a worker."""
+    if on_event is not None:
+        try:
+            on_event(event)
+        except Exception:
+            _LOG.exception("on_event callback raised")
+
+    if on_progress is not None and event.phase in ("completed", "failed"):
+        item = event.result if event.phase == "completed" else event.failure
+        if item is not None:
+            try:
+                on_progress(item)
+            except Exception:
+                _LOG.exception("on_progress callback raised")
 
 
 def _error_type(exc: BaseException) -> str:
@@ -638,7 +969,7 @@ class PdfConverter:
     Use as a context manager so the workers (and their Word instances) are shut down::
 
         with PdfConverter(workers=4, format="html") as conv:
-            conv.convert_many(pdfs, out_dir="out")
+            conv.convert_many("Cloud", out_dir="out", recursive=True)
 
     Without a ``with`` block the pool stays alive until ``close()`` or process exit.
     """
@@ -765,10 +1096,7 @@ class PdfConverter:
 
     @staticmethod
     def _normalise_source(source: str | os.PathLike[str]) -> Path:
-        path = Path(source).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        return path
+        return _absolute(source)
 
     def _validate_format(self, fmt: str | None) -> str:
         fmt = self.format if fmt is None else fmt
@@ -776,6 +1104,27 @@ class PdfConverter:
             raise ValidationError(
                 f"Unknown format {fmt!r}. Choose one of: {', '.join(FORMATS)}.")
         return fmt
+
+    @staticmethod
+    def _validate_limits(timeout: int | None, retries: int | None) -> None:
+        if timeout is not None and int(timeout) < 0:
+            raise ValidationError("timeout must be 0 or greater.")
+        if retries is not None and int(retries) < 0:
+            raise ValidationError("retries must be 0 or greater.")
+
+    def _check_output_conflict(
+        self, fmt: str, output: Path, force: bool
+    ) -> None:
+        _check_component_length(output, "Output path")
+        if _exists(output) and not force:
+            raise ValidationError(
+                f"Output already exists: {output} - pass force=True to overwrite.")
+        if fmt in ("html", "htmlfull"):
+            images = output.parent / self.images_folder
+            if _exists(images) and not force:
+                raise ValidationError(
+                    f"Image folder already exists: {images} - "
+                    "pass force=True to overwrite.")
 
     def _plan_single(
         self,
@@ -790,8 +1139,10 @@ class PdfConverter:
         fmt = self._validate_format(format)
         src = self._normalise_source(source)
         force = self.force if force is None else bool(force)
+        self._validate_limits(timeout, retries)
 
-        if not src.is_file():
+        _check_component_length(src, "Source path")
+        if not _is_file(src):
             raise ValidationError(f"Source file not found: {src}")
         if src.suffix.lower() != ".pdf":
             raise ValidationError(f"{src} is not a PDF. Only PDF input is supported.")
@@ -801,28 +1152,25 @@ class PdfConverter:
             output = src.with_suffix(extension)
         else:
             candidate = Path(out).expanduser()
-            is_dir = str(out).endswith(("/", "\\")) or candidate.is_dir()
+            is_dir = str(out).endswith(("/", "\\")) or _is_dir(candidate)
             if is_dir:
                 candidate = candidate / (src.stem + extension)
             elif not candidate.suffix:
                 candidate = candidate.with_suffix(extension)
-            output = candidate if candidate.is_absolute() else Path.cwd() / candidate
-            output = output.resolve()
+            output = _absolute(candidate)
 
         if output.suffix.lower() != extension:
             raise ValidationError(
                 f"Output extension {output.suffix!r} does not match format {fmt!r} "
                 f"({extension}).")
-        if output == src:
+        if _path_key(output) == _path_key(src):
             raise ValidationError(
                 "Refusing to overwrite the source PDF. Choose a different output path.")
-        if output.exists() and not force:
-            raise ValidationError(
-                f"Output already exists: {output} - pass force=True to overwrite.")
+        self._check_output_conflict(fmt, output, force)
 
         return _Job(
             index=0,
-            source=src.resolve(),
+            source=src,
             output=output,
             format=fmt,
             images_folder=self.images_folder,
@@ -843,12 +1191,106 @@ class PdfConverter:
         force: bool | None = None,
         timeout: int | None = None,
         retries: int | None = None,
+        on_event: Callable[[ProgressEvent], None] | None = None,
     ) -> ConversionResult:
-        """Convert one PDF. Output stays flat next to ``out`` (a file or a folder)."""
+        """Convert one PDF. Output stays flat next to ``out`` (a file or a folder).
+
+        ``on_event`` receives ``started``, then ``completed`` or ``failed``, then
+        ``finished``. Validation errors raised while planning the request happen
+        before any event.
+        """
         job = self._plan_single(
             source, out, format=format, force=force, timeout=timeout, retries=retries
         )
-        return self._slot(0).convert(job)
+
+        started = time.monotonic()
+        _notify_progress(
+            on_event,
+            None,
+            ProgressEvent(
+                phase="started",
+                index=1,
+                done=0,
+                total=1,
+                source=job.source,
+                output=job.output,
+                workers=1,
+            ),
+        )
+        _LOG.info("converting %s -> %s", job.source, job.output)
+
+        try:
+            result = _run_job(self._slot(0), job)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            failure = ConversionFailure(
+                source=job.source,
+                error=str(exc),
+                error_type=_error_type(exc),
+                attempts=1 if isinstance(exc, ValidationError) else job.retries + 1,
+            )
+            _notify_progress(
+                on_event,
+                None,
+                ProgressEvent(
+                    phase="failed",
+                    index=1,
+                    done=1,
+                    total=1,
+                    source=job.source,
+                    output=job.output,
+                    failure=failure,
+                    elapsed=elapsed,
+                    eta=0.0,
+                    workers=1,
+                ),
+            )
+            _notify_progress(
+                on_event,
+                None,
+                ProgressEvent(
+                    phase="finished",
+                    done=1,
+                    total=1,
+                    elapsed=elapsed,
+                    eta=0.0,
+                    workers=1,
+                ),
+            )
+            _LOG.warning("failed %s: %s", job.source, exc)
+            raise
+
+        elapsed = time.monotonic() - started
+        _notify_progress(
+            on_event,
+            None,
+            ProgressEvent(
+                phase="completed",
+                index=1,
+                done=1,
+                total=1,
+                source=job.source,
+                output=result.output,
+                result=result,
+                elapsed=elapsed,
+                eta=0.0,
+                workers=1,
+            ),
+        )
+        _notify_progress(
+            on_event,
+            None,
+            ProgressEvent(
+                phase="finished",
+                done=1,
+                total=1,
+                elapsed=elapsed,
+                eta=0.0,
+                workers=1,
+            ),
+        )
+        _LOG.info("converted %s -> %s in %.1fs", job.source, result.output, result.seconds)
+        return result
 
     def ping(self) -> dict:
         """Start (if needed) the first worker and return its diagnostics."""
@@ -874,87 +1316,158 @@ class PdfConverter:
         *,
         format: str | None = None,
         force: bool | None = None,
-        layout: str = "subfolders",
+        layout: str = "auto",
+        recursive: bool = False,
+        base_dir: str | os.PathLike[str] | None = None,
         on_progress: Callable[[ConversionResult | ConversionFailure], None] | None = None,
+        on_event: Callable[[ProgressEvent], None] | None = None,
         fail_fast: bool = False,
         timeout: int | None = None,
         retries: int | None = None,
     ) -> BatchResult:
         """Convert many PDFs in parallel.
 
-        With ``out_dir`` the default layout gives every document its own subfolder::
+        ``sources`` may contain PDF files, folders, or both. Folders are expanded
+        non-recursively unless ``recursive=True``. A folder keeps its own name in the
+        output tree, so the input hierarchy is preserved::
 
-            out/report-a/report-a.html
-            out/report-a/source_folder/image001.png
-            out/report-b/report-b.html
-            out/report-b/source_folder/
+            Cloud/NF XXX/NFXXX.pdf
+              -> out/Cloud/NF XXX/NFXXX.docx
 
-        That keeps the fixed ``source_folder`` name collision-free. ``layout="flat"``
-        writes ``out/<stem>.<ext>`` instead and refuses duplicate names. HTML batches
-        also refuse any set of outputs that share a parent folder, since each export
-        writes one ``source_folder``.
+        Layouts:
+
+        * ``"auto"`` - mirror when a folder or ``base_dir`` is involved, otherwise one
+          subfolder per document (the previous behaviour for plain file lists).
+        * ``"mirror"`` - preserve the input tree under ``out_dir``. Pass ``base_dir``
+          when ``sources`` are individual files.
+        * ``"subfolders"`` - ``out/<stem>/<stem>.<ext>`` for every document.
+        * ``"flat"`` - ``out/<stem>.<ext>``; duplicate names are refused.
+
+        HTML documents always get their own folder in mirror layout
+        (``.../NFXXX/NFXXX.html`` + ``source_folder``): the image folder name is fixed,
+        so two documents in one folder would overwrite each other's pictures.
+
+        ``on_progress`` is the original one-argument callback; it is called for every
+        success and every failure, including validation failures detected before Word
+        is touched. ``on_event`` receives ``ProgressEvent`` objects with ``started``,
+        ``completed``, ``failed`` and (once per batch) ``finished`` phases, plus
+        ``done``/``total``, elapsed time and an ETA.
         """
         fmt = self._validate_format(format)
         force = self.force if force is None else bool(force)
-        if layout not in ("subfolders", "flat"):
-            raise ValidationError("layout must be 'subfolders' or 'flat'.")
+        self._validate_limits(timeout, retries)
+        if layout not in ("auto", "mirror", "subfolders", "flat"):
+            raise ValidationError(
+                "layout must be 'auto', 'mirror', 'subfolders' or 'flat'.")
         if isinstance(sources, (str, os.PathLike)):
             sources = [sources]
 
-        base = Path(out_dir).expanduser().resolve() if out_dir is not None else None
-        if base is not None and base.exists() and not base.is_dir():
+        base = _absolute(out_dir) if out_dir is not None else None
+        if base is not None and _exists(base) and not _is_dir(base):
             raise ValidationError(f"out_dir must be a folder, not a file: {base}")
+        root_dir = _absolute(base_dir) if base_dir is not None else None
+        if root_dir is not None and _exists(root_dir) and not _is_dir(root_dir):
+            raise ValidationError(f"base_dir must be a folder, not a file: {root_dir}")
         extension = FORMATS[fmt]
 
-        jobs: list[_Job] = []
-        failures: list[ConversionFailure] = []
-        used_outputs: dict[str, Path] = {}
-        used_folders: set[str] = set()
-        seen_sources: set[str] = set()
+        # Expand folders and pair every file with its path relative to the input root.
+        entries: list[tuple[int, Path, Path]] = []
+        failures: list[tuple[int, ConversionFailure]] = []
+        contains_folder = False
+        sequence = 0
 
         for source in sources:
             src = self._normalise_source(source)
             try:
-                if not src.is_file():
-                    raise ValidationError(f"Source file not found: {src}")
-                if src.suffix.lower() != ".pdf":
-                    raise ValidationError(f"{src} is not a PDF. Only PDF input is supported.")
+                _check_component_length(src, "Source path")
+                if _is_dir(src):
+                    contains_folder = True
+                    files = _iter_pdfs(src, recursive)
+                    if not files:
+                        raise ValidationError(f"No PDF files found in folder: {src}")
+                    root = root_dir if root_dir is not None else src.parent
+                    for file in files:
+                        rel = _relative_to(file, root)
+                        if rel is None:
+                            raise ValidationError(
+                                f"{file} is not inside base_dir {root}.")
+                        sequence += 1
+                        entries.append((sequence, file, rel))
+                elif _is_file(src):
+                    if src.suffix.lower() != ".pdf":
+                        raise ValidationError(
+                            f"{src} is not a PDF. Only PDF input is supported.")
+                    root = root_dir if root_dir is not None else src.parent
+                    rel = _relative_to(src, root)
+                    if rel is None:
+                        raise ValidationError(f"{src} is not inside base_dir {root}.")
+                    sequence += 1
+                    entries.append((sequence, src, rel))
+                else:
+                    raise ValidationError(f"Source file or folder not found: {src}")
+            except ValidationError as exc:
+                sequence += 1
+                failures.append((sequence, ConversionFailure(
+                    source=src, error=str(exc), error_type="validation", attempts=0
+                )))
 
-                resolved = src.resolve()
-                source_key = str(resolved).lower()
+        effective = layout
+        if layout == "auto":
+            effective = "mirror" if (root_dir is not None or contains_folder) else "subfolders"
+
+        jobs: list[_Job] = []
+        used_outputs: dict[str, Path] = {}
+        used_folders: set[str] = set()
+        seen_sources: set[str] = set()
+        order: dict[str, int] = {}
+
+        for seq, src, rel in entries:
+            order[_path_key(src)] = seq
+            try:
+                if src.suffix.lower() != ".pdf":
+                    raise ValidationError(
+                        f"{src} is not a PDF. Only PDF input is supported.")
+                source_key = _path_key(src)
                 if source_key in seen_sources:
-                    raise ValidationError(f"Duplicate input in this batch: {resolved}")
+                    raise ValidationError(f"Duplicate input in this batch: {src}")
                 seen_sources.add(source_key)
 
                 if base is None:
                     output = src.with_suffix(extension)
-                    if output == src:
-                        raise ValidationError(
-                            "Refusing to overwrite the source PDF. Choose an out_dir.")
-                elif layout == "flat":
+                elif effective == "flat":
                     output = base / (src.stem + extension)
-                    key = str(output).lower()
-                    if key in used_outputs:
-                        raise ValidationError(
-                            f"Two inputs would both write {output} "
-                            f"({used_outputs[key]} and {src}); use layout='subfolders'.")
-                    used_outputs[key] = src
-                else:
+                elif effective == "subfolders":
                     folder = base / src.stem
                     counter = 2
-                    while str(folder).lower() in used_folders:
+                    while _path_key(folder) in used_folders:
                         folder = base / f"{src.stem}-{counter}"
                         counter += 1
-                    used_folders.add(str(folder).lower())
+                    used_folders.add(_path_key(folder))
                     output = folder / (folder.name + extension)
+                else:  # mirror
+                    rel_parent = rel.parent
+                    folder = base if str(rel_parent) == "." else base / rel_parent
+                    if fmt in ("html", "htmlfull"):
+                        folder = folder / src.stem
+                    output = folder / (src.stem + extension)
 
-                if output.exists() and not force:
+                _check_component_length(output, "Output path")
+                if _path_key(output) == source_key:
                     raise ValidationError(
-                        f"Output already exists: {output} - pass force=True to overwrite.")
+                        "Refusing to overwrite the source PDF. Choose a different out_dir.")
+                output_key = _path_key(output)
+                if output_key in used_outputs:
+                    raise ValidationError(
+                        f"Two inputs would both write {output} "
+                        f"({used_outputs[output_key]} and {src}); "
+                        "adjust out_dir or base_dir.")
+                used_outputs[output_key] = src
+
+                self._check_output_conflict(fmt, output, force)
 
                 jobs.append(_Job(
-                    index=len(jobs) + len(failures),
-                    source=src.resolve(),
+                    index=seq,
+                    source=src,
                     output=output,
                     format=fmt,
                     images_folder=self.images_folder,
@@ -964,56 +1477,134 @@ class PdfConverter:
                     retries=self.retries if retries is None else int(retries),
                 ))
             except ValidationError as exc:
-                failures.append(ConversionFailure(
+                order.setdefault(_path_key(src), seq)
+                failures.append((seq, ConversionFailure(
                     source=src, error=str(exc), error_type="validation", attempts=0
-                ))
+                )))
 
-        result = BatchResult(failed=list(failures))
-        if not jobs:
+        failure_items = [failure for _, failure in failures]
+        total = len(jobs) + len(failure_items)
+        result = BatchResult(failed=list(failure_items))
+        if total == 0:
             return result
 
-        if fmt in ("html", "htmlfull") and len(jobs) > 1:
-            parents = {str(job.output.parent).lower() for job in jobs}
+        if jobs and fmt in ("html", "htmlfull") and len(jobs) > 1:
+            parents = {_path_key(job.output.parent) for job in jobs}
             if len(parents) < len(jobs):
                 raise ValidationError(
                     f"HTML batches need one output folder per document: every export "
                     f"writes to a single '{self.images_folder}' image folder, so "
                     f"{len(jobs)} documents in one folder would overwrite each other's "
-                    "images. Pass out_dir=... (default layout='subfolders') or convert "
-                    "them one at a time."
+                    "images. Use layout='mirror' or 'subfolders', or convert them one "
+                    "at a time."
                 )
 
-        if self.workers_explicit:
-            count = min(self.workers, len(jobs))
+        if jobs:
+            if self.workers_explicit:
+                count = min(self.workers, len(jobs))
+            else:
+                # Word cold-starts cost 5-15 s per instance, and on a hybrid CPU more
+                # instances than fast cores mostly buys startup contention. Small
+                # batches therefore use fewer workers. An explicit workers=N is always
+                # honoured.
+                count = min(self.workers, max(1, math.ceil(len(jobs) / 12)))
         else:
-            # Word cold-starts cost 5-15 s per instance, and on a hybrid CPU more
-            # instances than fast cores mostly buys startup contention. Small batches
-            # therefore use fewer workers. An explicit workers=N is always honoured.
-            count = min(self.workers, max(1, math.ceil(len(jobs) / 12)))
+            count = 0
+
         slots = [self._slot(i) for i in range(count)]
-        _LOG.debug("batch: %d job(s), using %d worker(s)", len(jobs), count)
+        _LOG.info(
+            "batch: %d document(s), %d pre-flight failure(s), %d worker(s), layout=%s",
+            len(jobs), len(failure_items), count, effective,
+        )
+
+        batch_started = time.monotonic()
+        progress_lock = threading.Lock()
+        callback_lock = threading.Lock()
+        done = 0
+
+        def notify(event: ProgressEvent) -> None:
+            # The callbacks are serialised so a library user can print safely.
+            with callback_lock:
+                _notify_progress(on_event, on_progress, event)
+
+        def started_event(job: _Job) -> None:
+            with progress_lock:
+                current_done = done
+                elapsed = time.monotonic() - batch_started
+                eta = _estimate_eta(current_done, total, elapsed)
+            notify(ProgressEvent(
+                phase="started",
+                index=job.index,
+                done=current_done,
+                total=total,
+                source=job.source,
+                output=job.output,
+                elapsed=elapsed,
+                eta=eta,
+                workers=count,
+            ))
+
+        def finished_event(
+            phase: str,
+            *,
+            index: int,
+            source: Path,
+            output: Path | None = None,
+            converted: ConversionResult | None = None,
+            failure: ConversionFailure | None = None,
+        ) -> None:
+            nonlocal done
+            with progress_lock:
+                done += 1
+                current_done = done
+                elapsed = time.monotonic() - batch_started
+                eta = _estimate_eta(current_done, total, elapsed)
+            notify(ProgressEvent(
+                phase=phase,
+                index=index,
+                done=current_done,
+                total=total,
+                source=source,
+                output=output,
+                result=converted,
+                failure=failure,
+                elapsed=elapsed,
+                eta=eta,
+                workers=count,
+            ))
+
+        # Pre-flight failures are documents too: report them before the workers start.
+        for seq, failure in sorted(failures, key=lambda item: item[0]):
+            _LOG.warning("skipped %s: %s", failure.source, failure.error)
+            finished_event(
+                "failed", index=seq, source=failure.source, failure=failure
+            )
+
+        if not jobs:
+            elapsed = time.monotonic() - batch_started
+            notify(ProgressEvent(
+                phase="finished",
+                done=done,
+                total=total,
+                elapsed=elapsed,
+                eta=0.0,
+                workers=0,
+            ))
+            _LOG.info("batch finished: 0 converted, %d failed in %.1fs",
+                      len(failure_items), elapsed)
+            return result
 
         job_queue: "queue.Queue[_Job]" = queue.Queue()
         for job in jobs:
             job_queue.put(job)
 
         results: list[ConversionResult] = []
-        all_failures: list[ConversionFailure] = list(failures)
+        all_failures: list[ConversionFailure] = list(failure_items)
         result_lock = threading.Lock()
-        callback_lock = threading.Lock()
         stop = threading.Event()
         started = threading.Event()
         start_errors: list[tuple[int, Exception]] = []
         start_lock = threading.Lock()
-
-        def report(item: ConversionResult | ConversionFailure) -> None:
-            if on_progress is None:
-                return
-            with callback_lock:
-                try:
-                    on_progress(item)
-                except Exception:  # a broken callback must not kill a worker
-                    _LOG.exception("on_progress callback raised")
 
         def run(slot: _Slot) -> None:
             # Do not wait for the whole pool: the first worker to come up starts
@@ -1031,8 +1622,12 @@ class PdfConverter:
                     job = job_queue.get_nowait()
                 except queue.Empty:
                     return
+
+                started_event(job)
+                _LOG.info("[%d/%d] starting %s",
+                          job.index, total, job.source.name)
                 try:
-                    converted = slot.convert(job)
+                    converted = _run_job(slot, job)
                 except Exception as exc:  # noqa: BLE001 - recorded per document
                     failure = ConversionFailure(
                         source=job.source,
@@ -1042,13 +1637,30 @@ class PdfConverter:
                     )
                     with result_lock:
                         all_failures.append(failure)
-                    report(failure)
+                    finished_event(
+                        "failed",
+                        index=job.index,
+                        source=job.source,
+                        output=job.output,
+                        failure=failure,
+                    )
+                    _LOG.warning("[%d/%d] failed %s: %s",
+                                 job.index, total, job.source.name, exc)
                     if fail_fast:
                         stop.set()
                 else:
                     with result_lock:
                         results.append(converted)
-                    report(converted)
+                    finished_event(
+                        "completed",
+                        index=job.index,
+                        source=job.source,
+                        output=converted.output,
+                        converted=converted,
+                    )
+                    _LOG.info("[%d/%d] converted %s -> %s (%.1fs)",
+                              job.index, total, job.source.name,
+                              converted.output.name, converted.seconds)
 
         runners = [threading.Thread(target=run, args=(slot,), daemon=True, name=f"pdf2word-job-{slot.index}")
                    for slot in slots]
@@ -1064,9 +1676,24 @@ class PdfConverter:
             _LOG.warning("worker %d failed to start (%s); using %d worker(s)",
                          index, exc, count - len(start_errors))
 
-        order = {job.source: job.index for job in jobs}
-        result.ok = sorted(results, key=lambda item: order.get(item.source, 0))
-        result.failed = sorted(all_failures, key=lambda item: order.get(item.source, 0))
+        with progress_lock:
+            done_now = done
+            elapsed = time.monotonic() - batch_started
+        cancelled = max(0, total - done_now)
+        notify(ProgressEvent(
+            phase="finished",
+            done=done_now,
+            total=total,
+            elapsed=elapsed,
+            eta=0.0,
+            workers=count,
+            cancelled=cancelled,
+        ))
+        _LOG.info("batch finished: %d converted, %d failed, %d cancelled in %.1fs",
+                  len(results), len(all_failures), cancelled, elapsed)
+
+        result.ok = sorted(results, key=lambda item: order.get(_path_key(item.source), 0))
+        result.failed = sorted(all_failures, key=lambda item: order.get(_path_key(item.source), 0))
         return result
 
 
@@ -1120,18 +1747,6 @@ def _running_word_pids() -> list[int]:
     return pids
 
 
-def _expand_inputs(inputs: Sequence[str], recursive: bool) -> list[Path]:
-    results: list[Path] = []
-    for raw in inputs:
-        path = Path(raw).expanduser()
-        if path.is_dir():
-            pattern = "**/*.pdf" if recursive else "*.pdf"
-            results.extend(sorted(path.glob(pattern)))
-        else:
-            results.append(path)
-    return results
-
-
 def _configure_logging(verbose: bool) -> None:
     logger = logging.getLogger("pdf2word")
     if verbose:
@@ -1171,10 +1786,30 @@ def _failure_json(failure: ConversionFailure) -> str:
 
 def cmd_convert(args: argparse.Namespace) -> int:
     fmt = args.format
-    inputs = _expand_inputs(args.inputs, args.recursive)
-    if not inputs:
-        print("No PDF files matched.", file=sys.stderr)
-        return 2
+    raw_inputs = [str(item) for item in args.inputs]
+    folder_inputs = [
+        item for item in raw_inputs if _is_dir(Path(item).expanduser())
+    ]
+    single_file = len(raw_inputs) == 1 and not folder_inputs
+
+    layout = args.layout
+    if args.flat:
+        if layout not in ("auto", "flat"):
+            print(
+                "error: --flat is the same as --layout flat; use one or the other.",
+                file=sys.stderr,
+            )
+            return 2
+        layout = "flat"
+
+    if folder_inputs and args.out:
+        out_path = Path(args.out).expanduser()
+        if out_path.suffix.lower() == FORMATS[fmt] and not _is_dir(out_path):
+            print(
+                f"error: --out must be a folder when an input is a folder: {args.out}",
+                file=sys.stderr,
+            )
+            return 2
 
     converter_kwargs = dict(
         format=fmt,
@@ -1186,22 +1821,79 @@ def cmd_convert(args: argparse.Namespace) -> int:
         force=args.force,
     )
 
-    def emit(result: ConversionResult | ConversionFailure) -> None:
-        if args.json:
-            line = _result_json(result) if isinstance(result, ConversionResult) else _failure_json(result)
-            print(line, flush=True)
+    use_progress = (
+        bool(getattr(args, "progress", False))
+        and not args.json
+        and not args.quiet
+        and sys.stderr.isatty()
+    )
+
+    def counter(event: ProgressEvent) -> str:
+        return f"[{event.done}/{event.total}] " if event.total > 1 else ""
+
+    def draw_progress(event: ProgressEvent) -> None:
+        if not use_progress or event.total <= 1:
             return
-        if isinstance(result, ConversionResult):
-            if not args.quiet:
-                print(f"  ok  {result}", flush=True)
-        else:
-            print(f"  ERR {failure_line(result)}", file=sys.stderr, flush=True)
+        width = max(40, shutil.get_terminal_size((120, 20)).columns - 1)
+        elapsed = event.elapsed or 0.0
+        rate = (event.done / elapsed * 60.0) if elapsed > 0 and event.done > 0 else 0.0
+        eta_text = f"{event.eta:4.0f}s" if event.eta is not None else "  --"
+        name = event.source.name if event.source else ""
+        line = (f"[{event.done}/{event.total}] {event.percent:5.1f}%  "
+                f"{rate:5.1f}/min  ETA {eta_text}  {name}")
+        sys.stderr.write("\r" + line[:width].ljust(width))
+        sys.stderr.flush()
+
+    def clear_progress() -> None:
+        if not use_progress:
+            return
+        width = max(40, shutil.get_terminal_size((120, 20)).columns - 1)
+        sys.stderr.write("\r" + " " * width + "\r")
+        sys.stderr.flush()
+
+    emitted_failures = 0
+
+    def emit_event(event: ProgressEvent) -> None:
+        nonlocal emitted_failures
+        if event.phase == "failed" and event.failure is not None:
+            emitted_failures += 1
+
+        if args.json:
+            if event.phase == "completed" and event.result is not None:
+                print(_result_json(event.result), flush=True)
+            elif event.phase == "failed" and event.failure is not None:
+                print(_failure_json(event.failure), flush=True)
+            return
+
+        bar = use_progress and event.total > 1
+        if event.phase == "started":
+            if bar:
+                draw_progress(event)
+            return
+        if event.phase == "completed":
+            if not bar and not args.quiet and event.result is not None:
+                print(f"  ok  {counter(event)}{event.result}", flush=True)
+            if bar:
+                draw_progress(event)
+            return
+        if event.phase == "failed":
+            if bar:
+                clear_progress()
+            if event.failure is not None:
+                print(f"  ERR {counter(event)}{failure_line(event.failure)}",
+                      file=sys.stderr, flush=True)
+            if bar:
+                draw_progress(event)
+            return
+        if event.phase == "finished":
+            if bar:
+                clear_progress()
 
     started = time.monotonic()
     try:
         with PdfConverter(**converter_kwargs) as converter:
-            if len(inputs) == 1:
-                source = inputs[0]
+            if single_file:
+                source = Path(raw_inputs[0]).expanduser()
                 out = None
                 if args.out:
                     out_path = Path(args.out).expanduser()
@@ -1209,24 +1901,45 @@ def cmd_convert(args: argparse.Namespace) -> int:
                         out = out_path
                     else:
                         out = out_path / (source.stem + FORMATS[fmt])
-                result = converter.convert(source, out=out, force=args.force)
-                emit(result)
+                result = converter.convert(
+                    source, out=out, force=args.force, on_event=emit_event
+                )
                 ok, failed = 1, []
             else:
                 batch = converter.convert_many(
-                    inputs,
+                    raw_inputs,
                     out_dir=args.out,
-                    layout="flat" if args.flat else "subfolders",
-                    on_progress=emit,
+                    layout=layout,
+                    recursive=args.recursive,
+                    base_dir=args.base_dir,
+                    on_event=emit_event,
                     fail_fast=args.fail_fast,
                 )
                 ok, failed = len(batch.ok), batch.failed
+                if batch.total == 0:
+                    print("No PDF files matched.", file=sys.stderr)
+                    return 2
     except (PdfToWordError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        clear_progress()
+        if single_file and emitted_failures == 0:
+            if args.json:
+                failure = ConversionFailure(
+                    source=Path(raw_inputs[0]).expanduser(),
+                    error=str(exc),
+                    error_type=_error_type(exc),
+                    attempts=0,
+                )
+                print(_failure_json(failure), flush=True)
+            else:
+                print(f"error: {exc}", file=sys.stderr)
+        elif not single_file:
+            print(f"error: {exc}", file=sys.stderr)
+        # A single-file runtime failure was already printed by emit_event.
         return 2
 
     elapsed = time.monotonic() - started
     if not args.json:
+        clear_progress()
         summary = f"{ok} converted, {len(failed)} failed in {elapsed:.1f}s"
         print(summary, file=sys.stderr if failed else sys.stdout)
     return 0 if not failed else 1
@@ -1301,8 +2014,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
-    source = Path(args.input).expanduser().resolve()
-    if not source.is_file():
+    source = _absolute(args.input)
+    if not _is_file(source):
         print(f"error: source file not found: {source}", file=sys.stderr)
         return 2
     if args.copies < 1:
@@ -1319,7 +2032,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     pdfs: list[Path] = []
     for index in range(args.copies):
         destination = copies_dir / f"case-{index + 1:02d}.pdf"
-        shutil.copy2(source, destination)
+        _copy_file(source, destination)
         pdfs.append(destination)
 
     print(f"{args.copies} copies of {source.name}; format={args.format}; timeout={args.timeout}s")
@@ -1397,8 +2110,9 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  pdf2word convert report.pdf --format html\n"
+            "  pdf2word convert C:\\Cloud -r --out out --format docx\n"
             "  pdf2word convert in\\*.pdf --out out --workers 4\n"
-            "  pdf2word convert in -r --out out --format docx --force\n"
+            "  pdf2word convert in -r --out out --layout mirror --format docx --force\n"
             "  pdf2word doctor\n"
             "  pdf2word bench sample.pdf --copies 16 --workers 1 2 4 6\n"
         ),
@@ -1408,7 +2122,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     convert = sub.add_parser("convert", help="convert one or more PDFs")
     convert.add_argument("inputs", nargs="+", help="PDF files and/or folders")
-    convert.add_argument("-o", "--out", help="output folder (or file for a single input)")
+    convert.add_argument("-o", "--out",
+                         help="output folder (or a file for a single-file input)")
     convert.add_argument("--format", choices=list(FORMATS), default=DEFAULT_FORMAT)
     convert.add_argument("--workers", type=int, default=None,
                          help=f"parallel Word instances (default {default_workers()})")
@@ -1421,14 +2136,23 @@ def _build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                          help=f"retries after a failure (default {DEFAULT_RETRIES})")
     convert.add_argument("-f", "--force", action="store_true", help="overwrite existing output")
+    convert.add_argument("--layout", choices=("auto", "mirror", "subfolders", "flat"),
+                         default="auto",
+                         help="output tree: auto (mirror folders, subfolders for file "
+                              "lists), mirror, subfolders, or flat")
+    convert.add_argument("--base-dir", default=None,
+                         help="root used to compute relative paths in mirror layout")
     convert.add_argument("--flat", action="store_true",
-                         help="batch: write all documents into --out instead of one subfolder each")
+                         help="alias for --layout flat")
     convert.add_argument("--fail-fast", action="store_true",
                          help="stop starting new conversions after the first failure")
     convert.add_argument("-r", "--recursive", action="store_true",
-                         help="when an input is a folder, search it recursively")
+                         help="expand input folders recursively")
     convert.add_argument("--json", action="store_true", help="one JSON object per result")
     convert.add_argument("-q", "--quiet", action="store_true", help="only print failures")
+    convert.add_argument("--progress", action="store_true",
+                         help="show an in-place progress line (TTY only; ignored with "
+                              "--json or --quiet)")
     convert.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     convert.set_defaults(func=cmd_convert)
 
