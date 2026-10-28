@@ -510,6 +510,7 @@ function Complete-PdfToWordOutput {
         [Parameter(Mandatory)][string]$OutputPath,
         [string]$ImagesFolderName = $script:PdfToWordDefaultImagesFolder,
         [ValidateSet('png', 'original')][string]$ImageFormat = 'png',
+        [datetime]$Since = [datetime]::MinValue,
         [switch]$Force
     )
 
@@ -522,11 +523,62 @@ function Complete-PdfToWordOutput {
 
     $outDir       = Split-Path -Parent $OutputPath
     $stem         = [IO.Path]::GetFileNameWithoutExtension($OutputPath)
-    $wordFolder   = Join-Path $outDir ($stem + '_files')
     $targetFolder = Join-Path $outDir $ImagesFolderName
 
-    if ((Test-Path -LiteralPath $wordFolder -PathType Container) -and
-        ($wordFolder -ne $targetFolder)) {
+    # Word's HTML companion folder is localized: English "<stem>_files", French
+    # "<stem>_fichiers", German "<stem>_Dateien", ... It is also URL-encoded in the
+    # HTML when the name has spaces. Find it by what the HTML references, then by
+    # the "<stem>_" prefix, rather than assuming an English suffix.
+    $htmlText = $null
+    if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+        $htmlText = [IO.File]::ReadAllText($OutputPath, [Text.Encoding]::UTF8)
+    }
+
+    $wordFolder = $null
+    $wordFolderName = $null
+    if (Test-Path -LiteralPath $outDir -PathType Container) {
+        $notBefore = if ($Since -eq [datetime]::MinValue) { $Since } else { $Since.AddSeconds(-2) }
+        $candidateDirs = @(Get-ChildItem -LiteralPath $outDir -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -ne $ImagesFolderName -and
+                $_.LastWriteTime -ge $notBefore
+            })
+
+        $referencedNames = @()
+        if ($htmlText) {
+            foreach ($m in [regex]::Matches($htmlText, '(?i)(?:src|href)\s*=\s*["'']?([^"''\s>]+)')) {
+                $url = $m.Groups[1].Value
+                $segment = ($url -split '[\\/]')[0]
+                if ($segment) {
+                    try { $referencedNames += [Uri]::UnescapeDataString($segment) }
+                    catch { $referencedNames += $segment }
+                }
+            }
+        }
+
+        if ($referencedNames.Count -gt 0) {
+            $wordFolder = $candidateDirs |
+                Where-Object { $referencedNames -contains $_.Name } |
+                Select-Object -First 1
+        }
+
+        if (-not $wordFolder) {
+            $prefixed = @($candidateDirs | Where-Object {
+                $_.Name.StartsWith($stem + '_', [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($prefixed.Count -eq 1) {
+                $wordFolder = $prefixed[0]
+            }
+            elseif ($prefixed.Count -gt 1) {
+                $wordFolder = $prefixed | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            }
+        }
+
+        if ($wordFolder) { $wordFolderName = $wordFolder.Name }
+    }
+
+    if ($wordFolder -and
+        ([IO.Path]::GetFullPath($wordFolder.FullName) -ne [IO.Path]::GetFullPath($targetFolder))) {
 
         if (Test-Path -LiteralPath $targetFolder) {
             if ($Force) {
@@ -538,25 +590,25 @@ function Complete-PdfToWordOutput {
             }
         }
 
-        Move-Item -LiteralPath $wordFolder -Destination $targetFolder -ErrorAction Stop
+        Move-Item -LiteralPath $wordFolder.FullName -Destination $targetFolder -ErrorAction Stop
 
-        # Word URL-encodes the folder name in the HTML when the output file name has
-        # spaces or non-ASCII characters ("cafe resume.html" -> "cafe%20resume_files").
-        # Patch every form the encoder may have produced, not just the raw name.
-        $htmlText = [IO.File]::ReadAllText($OutputPath, [Text.Encoding]::UTF8)
-        $patched = $htmlText
-        $folderCandidates = @(
-            $stem + '_files'
-            [Uri]::EscapeDataString($stem) + '_files'
-            [Uri]::EscapeUriString($stem) + '_files'
-        ) | Select-Object -Unique
-        foreach ($candidate in $folderCandidates) {
-            if ($candidate -and $candidate -ne $ImagesFolderName) {
-                $patched = $patched.Replace($candidate, $ImagesFolderName)
+        # Patch every form the encoder may have produced for the actual (localized)
+        # folder name, not just the English "<stem>_files".
+        if ($htmlText) {
+            $patched = $htmlText
+            $folderCandidates = @(
+                $wordFolderName
+                [Uri]::EscapeDataString($wordFolderName)
+                [Uri]::EscapeUriString($wordFolderName)
+            ) | Select-Object -Unique
+            foreach ($candidate in $folderCandidates) {
+                if ($candidate -and $candidate -ne $ImagesFolderName) {
+                    $patched = $patched.Replace($candidate, $ImagesFolderName)
+                }
             }
-        }
-        if ($patched -ne $htmlText) {
-            [IO.File]::WriteAllText($OutputPath, $patched, (New-Object Text.UTF8Encoding($false)))
+            if ($patched -ne $htmlText) {
+                [IO.File]::WriteAllText($OutputPath, $patched, (New-Object Text.UTF8Encoding($false)))
+            }
         }
     }
 
@@ -694,7 +746,7 @@ function Invoke-PdfToWordConversion {
     }
 
     Complete-PdfToWordOutput -Spec $job.Spec -OutputPath $job.OutFile `
-        -ImagesFolderName $ImagesFolderName -ImageFormat $ImageFormat -Force:$Force
+        -ImagesFolderName $ImagesFolderName -ImageFormat $ImageFormat -Since $started -Force:$Force
 
     $companions = Get-PdfToWordCompanions -Spec $job.Spec -OutputPath $job.OutFile `
         -SourcePath $job.Pdf -ImagesFolderName $ImagesFolderName -Since $started

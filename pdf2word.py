@@ -42,7 +42,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 __all__ = [
     "PdfConverter",
@@ -1328,12 +1328,13 @@ class PdfConverter:
         """Convert many PDFs in parallel.
 
         ``sources`` may contain PDF files, folders, or both. Folders are expanded
-        non-recursively unless ``recursive=True``. A folder keeps its own name in the
-        output tree, so the input hierarchy is preserved::
+        non-recursively unless ``recursive=True``. A folder's **contents** are
+        mirrored under ``out_dir``; the input folder name itself is not repeated::
 
             Cloud/NF XXX/NFXXX.pdf
-              -> out/Cloud/NF XXX/NFXXX.docx
+              -> out/NF XXX/NFXXX.docx
 
+        Set ``base_dir`` to the parent of ``Cloud`` to keep ``Cloud`` in the output.
         Layouts:
 
         * ``"auto"`` - mirror when a folder or ``base_dir`` is involved, otherwise one
@@ -1343,9 +1344,9 @@ class PdfConverter:
         * ``"subfolders"`` - ``out/<stem>/<stem>.<ext>`` for every document.
         * ``"flat"`` - ``out/<stem>.<ext>``; duplicate names are refused.
 
-        HTML documents always get their own folder in mirror layout
-        (``.../NFXXX/NFXXX.html`` + ``source_folder``): the image folder name is fixed,
-        so two documents in one folder would overwrite each other's pictures.
+        HTML documents are normally written directly in their mirrored folder, next
+        to a ``source_folder`` image directory. If several HTML documents share one
+        folder, each gets a per-document subfolder to keep the image folders apart.
 
         ``on_progress`` is the original one-argument callback; it is called for every
         success and every failure, including validation failures detected before Word
@@ -1385,7 +1386,7 @@ class PdfConverter:
                     files = _iter_pdfs(src, recursive)
                     if not files:
                         raise ValidationError(f"No PDF files found in folder: {src}")
-                    root = root_dir if root_dir is not None else src.parent
+                    root = root_dir if root_dir is not None else src
                     for file in files:
                         rel = _relative_to(file, root)
                         if rel is None:
@@ -1447,8 +1448,6 @@ class PdfConverter:
                 else:  # mirror
                     rel_parent = rel.parent
                     folder = base if str(rel_parent) == "." else base / rel_parent
-                    if fmt in ("html", "htmlfull"):
-                        folder = folder / src.stem
                     output = folder / (src.stem + extension)
 
                 _check_component_length(output, "Output path")
@@ -1481,6 +1480,38 @@ class PdfConverter:
                 failures.append((seq, ConversionFailure(
                     source=src, error=str(exc), error_type="validation", attempts=0
                 )))
+
+        # Mirror layout normally puts each HTML document directly in its input
+        # directory. If a directory contains more than one HTML document, the fixed
+        # source_folder name would collide, so give every document in that directory
+        # its own subfolder.
+        if (effective == "mirror" and base is not None
+                and fmt in ("html", "htmlfull") and len(jobs) > 1):
+            groups: dict[str, list[_Job]] = {}
+            for job in jobs:
+                groups.setdefault(_path_key(job.output.parent), []).append(job)
+
+            adjusted: list[_Job] = []
+            for job in jobs:
+                if len(groups[_path_key(job.output.parent)]) <= 1:
+                    adjusted.append(job)
+                    continue
+
+                new_output = job.output.parent / job.output.stem / job.output.name
+                try:
+                    _check_component_length(new_output, "Output path")
+                    self._check_output_conflict(fmt, new_output, force)
+                except ValidationError as exc:
+                    order.setdefault(_path_key(job.source), job.index)
+                    failures.append((job.index, ConversionFailure(
+                        source=job.source,
+                        error=str(exc),
+                        error_type="validation",
+                        attempts=0,
+                    )))
+                    continue
+                adjusted.append(replace(job, output=new_output))
+            jobs = adjusted
 
         failure_items = [failure for _, failure in failures]
         total = len(jobs) + len(failure_items)
@@ -2141,7 +2172,8 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="output tree: auto (mirror folders, subfolders for file "
                               "lists), mirror, subfolders, or flat")
     convert.add_argument("--base-dir", default=None,
-                         help="root used to compute relative paths in mirror layout")
+                         help="root used to compute relative paths in mirror layout; "
+                              "use the input's parent to keep the input folder name")
     convert.add_argument("--flat", action="store_true",
                          help="alias for --layout flat")
     convert.add_argument("--fail-fast", action="store_true",

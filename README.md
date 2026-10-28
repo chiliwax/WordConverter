@@ -25,16 +25,18 @@ and `PdfToWordWorker.ps1` in the same folder.
 python pdf2word.py doctor                     # check Word, PowerShell, scripts
 python pdf2word.py convert report.pdf         # -> report.docx
 python pdf2word.py convert report.pdf --format html
-python pdf2word.py convert .\Cloud -r --out .\out --format docx
+python pdf2word.py convert .\Input -r --out .\out --format docx
 python pdf2word.py convert .\inbox -r --out .\out --format pdf --force
 python pdf2word.py bench .\sample.pdf --copies 48 --workers 2 4
 ```
 
-Inputs can be files and/or folders. A folder keeps its own name and its relative
-tree, so `Cloud\NF XXX\NFXXX.pdf` becomes `out\Cloud\NF XXX\NFXXX.docx`. Folders are
-searched non-recursively unless `-r/--recursive` is given. Use `--json` for one
-machine-readable object per result, `--quiet` to print only failures, and
-`--progress` for an in-place progress line in a terminal.
+Inputs can be files and/or folders. A folder's **contents** keep their relative
+tree, without repeating the input folder name: `Input\blockchain\NP 2025-32\NP 2025-32.pdf`
+becomes `out\blockchain\NP 2025-32\NP 2025-32.docx`. Use `--base-dir` on the parent
+to keep the `Input` level in the output. Folders are searched non-recursively unless
+`-r/--recursive` is given. Use `--json` for one machine-readable object per result,
+`--quiet` to print only failures, and `--progress` for an in-place progress line in
+a terminal.
 
 ### CLI reference
 
@@ -50,7 +52,7 @@ pdf2word convert INPUT... [options]
   --retries N             retries after a failure, default 1
   -f, --force             overwrite existing output
   --layout MODE           auto (default), mirror, subfolders, or flat
-  --base-dir PATH         root used to compute relative paths in mirror layout
+  --base-dir PATH         root for mirror paths; parent of input keeps its name
   --flat                  alias for --layout flat
   --fail-fast             stop taking new work after the first failure
   -r, --recursive         expand input folders recursively
@@ -68,27 +70,31 @@ be a directory.
 ### CLI examples
 
 ```powershell
-# Keep the whole hierarchy from the input folder
-python pdf2word.py convert "C:\Cloud" -r --out "C:\Converted" --format docx
+# Mirror the contents of the input folder
+python pdf2word.py convert "C:\Input" -r --out "C:\Converted" --format docx
+
+# Keep the "Input" level too (base_dir is the parent)
+python pdf2word.py convert "C:\Input" -r --out "C:\Converted" `
+    --base-dir "C:\"
 
 # One file (flat output)
-python pdf2word.py convert "C:\Cloud\NF 001\NF001.pdf" --out "C:\Converted"
+python pdf2word.py convert "C:\Input\blockchain\NP 2025-32\NP 2025-32.pdf" --out "C:\Converted"
 
 # Folder of files, flat, with 3 retries and a 5-minute watchdog
 python pdf2word.py convert "C:\Inbox" -r --out "C:\Converted" `
     --layout flat --retries 3 --timeout 300
 
-# HTML: every document gets its own folder + source_folder
-python pdf2word.py convert "C:\Cloud" -r --out "C:\Converted" --format html
+# HTML: NP 2025-32.html + source_folder in blockchain\NP 2025-32
+python pdf2word.py convert "C:\Input" -r --out "C:\Converted" --format html
 
 # Folders are recursive only with -r; a plain folder uses its direct PDFs
 python pdf2word.py convert "C:\Inbox" --out "C:\Converted"
 
 # In-place progress line with percentage, rate and ETA (terminal only)
-python pdf2word.py convert "C:\Cloud" -r --out "C:\Converted" --progress
+python pdf2word.py convert "C:\Input" -r --out "C:\Converted" --progress
 
 # One JSON object per document (including validation failures), no summary
-python pdf2word.py convert "C:\Cloud" -r --out "C:\Converted" --json
+python pdf2word.py convert "C:\Input" -r --out "C:\Converted" --json
 ```
 
 ## Library
@@ -100,15 +106,16 @@ with PdfConverter(format="docx", workers=4, timeout=120, retries=1) as conv:
     one = conv.convert("report.pdf", out="out/report.docx", force=True)
     print(one.output, one.pages, one.size_kb)
 
-    batch = conv.convert_many("Cloud", out_dir="out", recursive=True, force=True)
+    batch = conv.convert_many("Input", out_dir="out", recursive=True, force=True)
     print(f"{len(batch.ok)} converted, {len(batch.failed)} failed")
     for failure in batch.failed:
         print(failure.source, failure.error)
 ```
 
 `convert_many` accepts a single path or any iterable of paths. Items may be PDF
-files, folders, or a mix. A folder keeps its name in the output tree; use
-`recursive=True` to include nested folders.
+files, folders, or a mix. A folder's contents are mirrored under `out_dir`; use
+`recursive=True` to include nested folders. Pass `base_dir` if you want the input
+folder's own name included in the output.
 
 ### `PdfConverter(...)` options
 
@@ -188,47 +195,53 @@ safe. Results are returned in input order; callbacks arrive in completion order.
 
 ### Output layouts
 
-**`auto`** (default) mirrors the input tree when a folder or `base_dir` is involved.
-For a plain list of files it falls back to `subfolders`, preserving the previous
-behaviour.
+**`auto`** (default) mirrors the input contents when a folder or `base_dir` is
+involved. For a plain list of files it falls back to `subfolders`, preserving the
+previous behaviour.
 
-**`mirror`** preserves the hierarchy from the input root:
+**`mirror`** preserves the hierarchy *below* the input root; the input folder itself
+is not repeated:
 
 ```
-Cloud/NF XXX/NFXXX.pdf
-Cloud/NF YYY/NFYYY.pdf
+Input/blockchain/NP 2025-32/NP 2025-32.pdf
 
 out/
-  Cloud/
-    NF XXX/
-      NFXXX.docx
-    NF YYY/
-      NFYYY.docx
+  blockchain/
+    NP 2025-32/
+      NP 2025-32.docx
 ```
 
-A folder input includes its own name. With `base_dir`, paths are relative to that
-root instead:
+With `base_dir`, paths are relative to that root. Set it to the parent to include the
+input folder name:
+
+```python
+# run from the folder that contains Input
+conv.convert_many("Input", out_dir="out", recursive=True, base_dir=".")
+# out/Input/blockchain/NP 2025-32/NP 2025-32.docx
+```
+
+For an explicit file list, pass `base_dir` to get a mirror:
 
 ```python
 conv.convert_many(
-    ["Cloud/NF XXX/NFXXX.pdf", "Cloud/NF YYY/NFYYY.pdf"],
+    ["Input/blockchain/NP 2025-32/NP 2025-32.pdf"],
     out_dir="out",
-    base_dir="Cloud",
+    base_dir="Input",
 )
-# out/NF XXX/NFXXX.docx
-# out/NF YYY/NFYYY.docx
+# out/blockchain/NP 2025-32/NP 2025-32.docx
 ```
 
-HTML documents get an extra per-document folder in mirror mode:
+HTML is written directly in the mirrored folder, next to `source_folder`:
 
 ```
-out/Cloud/NF XXX/NFXXX/NFXXX.html
-out/Cloud/NF XXX/NFXXX/source_folder/image001.png
+out/blockchain/NP 2025-32/NP 2025-32.html
+out/blockchain/NP 2025-32/source_folder/image001.png
 ```
 
-This is required because every HTML export writes to a folder literally named
-`source_folder`; two HTML documents in the same directory would overwrite each
-other's pictures.
+If one folder contains several HTML documents, each gets its own subfolder
+(`.../NP 2025-32/NP 2025-32.html` style) so the fixed `source_folder` names do not
+collide. Word's localized companion folder (`_files`, `_fichiers`, `_Dateien`, ...)
+is detected and renamed to `source_folder` automatically.
 
 **`subfolders`** gives every document its own folder, ignoring the input tree:
 
@@ -299,7 +312,7 @@ def on_event(event):
         print(f"{event.percent:.0f}% {eta} in {event.elapsed:.1f}s")
 
 with PdfConverter() as conv:
-    conv.convert_many("Cloud", out_dir="out", recursive=True, on_event=on_event)
+    conv.convert_many("Input", out_dir="out", recursive=True, on_event=on_event)
 ```
 
 In a batch, a bad document (missing file, non-PDF, existing output without
@@ -318,14 +331,14 @@ inherit `PdfToWordError`.
 
 ```python
 with PdfConverter(timeout=300, retries=3) as conv:
-    batch = conv.convert_many("Cloud", out_dir="out", recursive=True)
+    batch = conv.convert_many("Input", out_dir="out", recursive=True)
 
     # or just for this batch
     batch = conv.convert_many("Other", out_dir="out", timeout=600, retries=5)
 ```
 
 ```powershell
-python pdf2word.py convert "C:\Cloud" -r --out "C:\Converted" `
+python pdf2word.py convert "C:\Input" -r --out "C:\Converted" `
     --timeout 300 --retries 3
 ```
 
@@ -470,8 +483,9 @@ python pdf2word.py bench .\sample.pdf --copies 48 --workers 1 2 4 --gap 10
   editable text.
 - Layout is reflowed, not reproduced. Columns, floats and complex tables move.
 - Encrypted PDFs fail.
-- HTML uses one fixed image folder name (`source_folder`), so one HTML document per
-  folder is required; the batch layouts enforce this.
+- HTML uses one fixed image folder name (`source_folder`). Mirror and subfolder
+  layouts give each document its own folder when needed; a flat HTML batch with
+  several documents is refused.
 - Word automation occasionally stalls; the watchdog and retry exist because of it.
 - The first Word start after a reboot, Office update, or antivirus scan can be slow;
   `--timeout` raises the per-document limit.

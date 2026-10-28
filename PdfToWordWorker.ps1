@@ -175,7 +175,7 @@ function Invoke-WorkerJob {
                     -WatchdogSeconds $timeout -WatchdogPid ([int]$session.Pid)
 
         Complete-PdfToWordOutput -Spec $job.Spec -OutputPath $job.OutFile `
-            -ImagesFolderName $imagesFolder -ImageFormat $imageFormat -Force:$force
+            -ImagesFolderName $imagesFolder -ImageFormat $imageFormat -Since $jobStart -Force:$force
     }
     catch {
         # A document that failed validation or post-processing is not a usable output.
