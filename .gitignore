@@ -26,6 +26,10 @@ source_folder/
 *.log
 pdf2word-bench-*/
 
+# ---- Local heavy inputs ----
+/anatomy-of-the-cat.docx
+/anatomy-of-the-cat.pdf
+
 # ---- OS and editors ----
 Thumbs.db
 Desktop.ini
