@@ -401,20 +401,25 @@ Results go to stdout; warnings, errors and progress go to stderr.
 
 ## Long paths
 
-Windows paths longer than the classic 260-character limit are handled
-automatically by the Python library and CLI:
+Word's own `SaveAs` limit is lower than Windows' 260-character `MAX_PATH` (around
+218 characters), and for HTML Word also counts the `<stem>_files` /
+`<stem>_fichiers` companion folder it creates beside the document. The Python
+library and CLI therefore stage proactively:
 
-- when the source, the destination, or an HTML image path is at least
-  250 characters, the document is copied to a short `%TEMP%\pdf2word-stage-*`
-  folder, converted there, then moved to the final destination using the
-  `\\?\` extended-length path prefix;
-- Word therefore never sees a long path, and the final file (and HTML
-  `source_folder`) lands where you asked;
+- when the source or destination path reaches **200 characters**, or the HTML
+  companion path gets close to that limit, the document is copied to a short
+  `%TEMP%\pdf2word-stage-*` folder;
+- inside the staging folder Word only sees short names: `input.pdf` and
+  `output.docx` / `output.html` / etc.;
+- the finished file (and HTML `source_folder`) is then moved to the real
+  destination using the `\\?\` extended-length path prefix, keeping the final
+  name exactly as requested;
 - staging folders are removed at the end of each job;
 - a single file or folder **name** is still limited to 255 characters by Windows,
   and that is reported as a validation error before conversion.
 
-This applies to `pdf2word.py` and `python pdf2word.py convert`. The legacy
+This handles deep directories and long final file names without exposing either to
+Word. It applies to `pdf2word.py` and `python pdf2word.py convert`. The legacy
 `Convert-PdfToWord.ps1` wrapper does not stage; prefer the Python CLI for very
 long paths.
 

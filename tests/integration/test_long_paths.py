@@ -91,6 +91,39 @@ class LongPathTests(WordTestCase):
                 converter.convert(source, out=output, force=True)
         self.assert_no_orphan_word(converter)
 
+    def test_long_filename_docx(self):
+        stem = "LJ 2025-106 " + ("N" * 170)
+        source = self.root / "in" / (stem + ".pdf")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pdf2word._win_long(SAMPLE_PDF), pdf2word._win_long(source))
+        output = self.root / "out" / (stem + ".docx")
+        self.assertGreater(len(source.name), 150)
+
+        converter = PdfConverter(workers=1, retries=0)
+        with converter:
+            result = converter.convert(source, out=output, force=True)
+        self.assertTrue(pdf2word._exists(result.output))
+        self.assertEqual(result.output.name, stem + ".docx")
+        self.assert_no_orphan_word(converter)
+
+    def test_long_filename_html(self):
+        stem = "LJ 2025-106 " + ("H" * 170)
+        source = self.root / "in" / (stem + ".pdf")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pdf2word._win_long(SAMPLE_PDF), pdf2word._win_long(source))
+        output = self.root / "out" / (stem + ".html")
+        self.assertGreater(len(source.name), 150)
+
+        converter = PdfConverter(workers=1, format="html", retries=0)
+        with converter:
+            result = converter.convert(source, out=output, force=True)
+        self.assertTrue(pdf2word._exists(result.output))
+        self.assertEqual(result.output.name, stem + ".html")
+        self.assertTrue(pdf2word._exists(
+            result.output.parent / "source_folder" / "image001.png"
+        ))
+        self.assert_no_orphan_word(converter)
+
 
 def PathRead(path):
     with open(pdf2word._fs_path(path), "r", encoding="utf-8") as handle:

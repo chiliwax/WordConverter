@@ -152,6 +152,30 @@ class StagingDecisionTests(unittest.TestCase):
         )
         self.assertTrue(pdf2word._needs_staging(job))
 
+    def test_word_limit_output_stages(self):
+        # Between Word's ~218 limit and the old 250 threshold.
+        long_output = "C:\\" + ("a" * 230) + "\\out.docx"
+        self.assertGreaterEqual(len(long_output), 218)
+        self.assertLess(len(long_output), 250)
+        job = make_job(r"C:\Data\in.pdf", long_output)
+        self.assertTrue(pdf2word._needs_staging(job))
+
+    def test_long_filename_stages(self):
+        long_name = ("n" * 210) + ".docx"
+        job = make_job(r"C:\Data\in.pdf", "C:\\Data\\" + long_name)
+        self.assertGreater(len(long_name), 200)
+        self.assertTrue(pdf2word._needs_staging(job))
+
+    def test_html_support_folder_can_trigger_staging(self):
+        # The .html path itself is below 200, but Word's <stem>_fichiers
+        # companion path is close enough to the Word limit.
+        parent = "C:\\" + ("a" * 111)
+        stem = "b" * 60
+        output = parent + "\\" + stem + ".html"
+        self.assertLess(len(output), 200)
+        job = make_job(r"C:\Data\in.pdf", output, fmt="html")
+        self.assertTrue(pdf2word._needs_staging(job))
+
 
 class SmallLogicTests(unittest.TestCase):
     def test_estimate_eta_without_data(self):

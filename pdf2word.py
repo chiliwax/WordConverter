@@ -42,7 +42,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 __all__ = [
     "PdfConverter",
@@ -90,6 +90,13 @@ IMAGES_FOLDER_SENTINEL = "source_folder"
 #: %TEMP% and the result is moved with the \\?\ long-path prefix. Word itself is
 #: not reliable with long paths, so it never sees one.
 LONG_PATH_THRESHOLD = 250
+
+#: Word's SaveAs has its own, lower path limit (roughly 218 characters) and
+#: counts the "<stem>_files"/"<stem>_fichiers" companion folder it writes for
+#: HTML. Stay well below that limit and let Word work in %TEMP%, then publish the
+#: result to the real destination. Short staged file names keep the final file
+#: name from reaching Word at all.
+WORD_PATH_LIMIT = 200
 
 _HERE = Path(__file__).resolve().parent
 _WORKER_SCRIPT = _HERE / "PdfToWordWorker.ps1"
@@ -820,17 +827,27 @@ def _is_rpc_failure(message: str) -> bool:
 
 
 def _needs_staging(job: _Job) -> bool:
-    """True when Word should work in %TEMP% because a path is too long."""
+    """True when Word should work in %TEMP% because a path is too long.
+
+    Word's SaveAs limit is lower than Windows' MAX_PATH and, for HTML, it also
+    counts the "<stem>_files"/"<stem>_fichiers" folder. A long output name can
+    therefore fail even when the final destination is below 250 characters.
+    """
     if os.name != "nt":
         return False
-    if len(os.fspath(job.source)) >= LONG_PATH_THRESHOLD:
+
+    if len(os.fspath(job.source)) >= WORD_PATH_LIMIT:
         return True
-    if len(os.fspath(job.output)) >= LONG_PATH_THRESHOLD:
+    if len(os.fspath(job.output)) >= WORD_PATH_LIMIT:
         return True
+
     if job.format in ("html", "htmlfull"):
-        images = job.output.parent / job.images_folder
-        if len(os.fspath(images)) + 40 >= LONG_PATH_THRESHOLD:
+        # Use the longest localized suffix we know plus a small margin: the
+        # companion folder is created beside the HTML with the full stem.
+        companion = job.output.parent / (job.output.stem + "_fichiers")
+        if len(os.fspath(companion)) + 20 >= WORD_PATH_LIMIT:
             return True
+
     return False
 
 
@@ -885,13 +902,11 @@ def _run_job(slot: _Slot, job: _Job) -> ConversionResult:
     staging = Path(tempfile.mkdtemp(prefix="pdf2word-stage-"))
     _LOG.debug("staging long-path job in %s", staging)
     try:
-        # Keep the real file names inside the short staging folder: Word then sees
-        # "NFXXX.pdf"/"NFXXX.docx" and cannot leak "input"/"output" into document
-        # metadata. Only a pdf -> pdf conversion can collide with its own source.
-        staged_source = staging / job.source.name
-        staged_output = staging / job.output.name
-        if _path_key(staged_source) == _path_key(staged_output):
-            staged_source = staging / ("source-" + job.source.name)
+        # Word must never see the final name: it can contain 200+ characters or
+        # live in a deep directory. Use fixed short names inside %TEMP%, then
+        # _publish_staged moves the result to job.output with the \\?\ prefix.
+        staged_source = staging / "input.pdf"
+        staged_output = staging / ("output" + FORMATS[job.format])
 
         _copy_file(job.source, staged_source)
         staged_job = replace(

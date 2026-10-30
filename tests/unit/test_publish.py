@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pdf2word
 from tests.helpers import (
+    FakeSlot,
     long_temp_dir,
     make_job,
     make_long_dir,
@@ -121,6 +122,22 @@ class PublishStagedTests(unittest.TestCase):
 
         self.assertTrue(pdf2word._exists(final))
         self.assertTrue(pdf2word._exists(final.parent / "source_folder" / "image001.png"))
+
+    def test_run_job_uses_short_staged_names(self):
+        source = self.root / "source.pdf"
+        source.write_bytes(b"%PDF-1.4")
+        long_parent = make_long_dir(self.root, components=5, size=45)
+        final = long_parent / "final.docx"
+        job = make_job(source, final)
+        slot = FakeSlot()
+
+        result = pdf2word._run_job(slot, job)
+
+        self.assertEqual(len(slot.calls), 1)
+        self.assertEqual(slot.calls[0].source.name, "input.pdf")
+        self.assertEqual(slot.calls[0].output.name, "output.docx")
+        self.assertEqual(result.output, final)
+        self.assertTrue(pdf2word._exists(final))
 
 
 if __name__ == "__main__":
