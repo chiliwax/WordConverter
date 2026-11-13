@@ -260,6 +260,34 @@ out/NFYYY.docx
 Duplicate names are refused. A flat HTML batch with more than one document is also
 refused, because all documents would share one `source_folder`.
 
+### Repairing existing HTML output
+
+`repair_html_outputs()` fixes HTML documents that were already converted, without
+starting Word:
+
+```python
+from pdf2word import repair_html_outputs
+
+summary = repair_html_outputs("out", dry_run=True)   # preview
+print(len(summary.repaired), len(summary.unchanged), len(summary.skipped))
+
+repair_html_outputs("out")                            # apply
+```
+
+It renames a leftover Word companion folder (`..._files`, `..._fichiers`,
+`..._Dateien`, ...) to `images_folder` and rewrites the page's links to it. Links
+are matched by decoding each path segment, so mixed encodings such as
+`Mesure%20applicative_FR_signé_fichiers` (percent-encoded space, raw accented
+letter) and CP1252 escapes such as `%C9` for `É` are handled. The second failure
+mode is also fixed: the folder is already `source_folder` but the page still
+points at the old name.
+
+The run is idempotent and never deletes anything: if both folders exist they are
+merged, same-name files stay in the old folder, and a second pass reports
+`unchanged`. `root` may be a folder (recursive by default) or a single `.html`
+file. The Python `test.py` wrapper exposes the same feature as
+`python test.py --output out --repair [--dry-run]`.
+
 ### Results
 
 `BatchResult` contains:

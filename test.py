@@ -8,9 +8,20 @@ from pathlib import Path
 # Ajout du dossier lib/ au path Python
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 
-from wordconverter.pdf2word import PdfConverter
-from doc_meta.doc_meta import META_FILENAME
-from downloader.ps_downloader import long_path 
+try:
+    # Projet appelant : la bibliotheque est vendue dans lib/wordconverter/.
+    from wordconverter.pdf2word import PdfConverter, ProgressEvent, repair_html_outputs
+except ModuleNotFoundError:
+    # Ce depot : le module est a la racine.
+    from pdf2word import PdfConverter, ProgressEvent, repair_html_outputs
+
+try:
+    from doc_meta.doc_meta import META_FILENAME
+    from downloader.ps_downloader import long_path
+except ModuleNotFoundError:
+    # Script execute hors du projet appelant : pas de metadonnees a copier.
+    META_FILENAME = None
+    long_path = str
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +55,9 @@ def copy_metadata(source: Path, output: Path) -> bool:
     Retourne True si la copie a réussi. Ne lève jamais d'exception : un échec
     de copie ne doit pas interrompre le reste du batch.
     """
+    if META_FILENAME is None:
+        return False
+
     src = Path(long_path(str(source.parent / META_FILENAME)))
     dst = Path(long_path(str(output.parent / META_FILENAME)))
     tmp = dst.with_suffix(".tmp")
@@ -138,11 +152,36 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         help="Fichier de log (optionnel, en plus de la console).",
     )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Ne convertit rien : répare les sorties HTML existantes dans --output "
+             "(dossier d'images + liens), sans lancer Word.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Avec --repair : affiche ce qui serait fait sans rien modifier.",
+    )
+    parser.add_argument(
+        "--images-folder",
+        default="source_folder",
+        metavar="NAME",
+        help="Nom du dossier d'images attendu par la conversion.",
+    )
     return parser.parse_args()        
 
 
 def setup_logging(log_file: Path | None = None) -> None:
     """Configure la console (format [LEVEL], lu par l'UI) et, si demandé, un fichier."""
+    # Console Windows en cp1252 : un message contenant un caractère hors page de
+    # codes doit être remplacé, pas lever une exception dans le logger.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     handlers: list[logging.Handler] = []
 
     console = logging.StreamHandler(sys.stdout)
@@ -166,12 +205,57 @@ def setup_logging(log_file: Path | None = None) -> None:
 
 
 
+def run_repair(output_dir: Path, images_folder: str, dry_run: bool) -> int:
+    """Répare les sorties HTML existantes, sans reconvertir et sans Word."""
+    if not output_dir.is_dir():
+        log.error("Le dossier de sortie '%s' n'existe pas ou n'est pas un dossier.", output_dir)
+        return 1
+
+    def on_result(result) -> None:
+        if result.action == "repaired":
+            details = []
+            if result.renamed_from:
+                details.append(f"dossier {result.renamed_from} -> {images_folder}")
+            if result.links_replaced:
+                details.append(f"{result.links_replaced} lien(s)")
+            log.info("Réparé   : %s (%s)", result.path, ", ".join(details))
+        elif result.action == "unchanged":
+            log.debug("Déjà bon : %s", result.path)
+        else:
+            log.warning("Ignoré   : %s — %s", result.path, result.detail)
+
+    summary = repair_html_outputs(
+        output_dir,
+        images_folder=images_folder,
+        recursive=True,
+        dry_run=dry_run,
+        on_result=on_result,
+    )
+
+    suffix = " (dry-run, rien n'a été écrit)" if dry_run else ""
+    log.info(
+        "Réparation terminée : %d réparé(s), %d déjà bon(s), %d ignoré(s)%s.",
+        len(summary.repaired),
+        len(summary.unchanged),
+        len(summary.skipped),
+        suffix,
+    )
+    return 0
+
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.log_file)
 
     input_dir: Path = args.input
     output_dir: Path = args.output
+
+    if args.dry_run and not args.repair:
+        log.error("--dry-run s'utilise avec --repair.")
+        sys.exit(2)
+
+    if args.repair:
+        sys.exit(run_repair(output_dir, args.images_folder, args.dry_run))
 
     if not input_dir.is_dir():
         log.error("Le dossier source '%s' n'existe pas ou n'est pas un dossier.", input_dir)

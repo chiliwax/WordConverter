@@ -499,27 +499,65 @@ function Resolve-PdfToWordJob {
 
 # ---------- HTML post-processing ----------
 
+# URLs inside src/href and CSS url(...). Quote-aware on purpose: a file name may
+# contain parentheses or apostrophes ("...S3%20(EN)_fichiers",
+# "...l'Etablissement_fichiers"), and a token split on those never matches.
+$script:PdfToWordHtmlUrlAttributePattern =
+    '(?is)\b(?:src|href)\s*=\s*(?:(?<dq>")(?<dqvalue>[^"]*)"|(?<sq>'')(?<sqvalue>[^'']*)''|(?<bare>[^\s>"'']+))'
+$script:PdfToWordHtmlCssUrlPattern =
+    '(?is)\burl\(\s*(?:(?<dq>")(?<dqvalue>[^"]*)"|(?<sq>'')(?<sqvalue>[^'']*)''|(?<bare>[^)\s>"'']*))'
+
 <#
-    Word does not use one encoding for its companion folder inside the HTML: it
-    percent-encodes what a URI forbids (space -> %20) but leaves UTF-8 letters raw
-    ("...signé_fichiers"), and it HTML-escapes &, ' and " in attribute values. The
-    exact spelling is therefore not predictable, so references are compared after
-    decoding instead of by literal string replacement.
+    Every plausible decoding of one URL path segment. Word mixes encodings, even
+    inside a single link: it percent-encodes what a URI forbids (space -> %20)
+    but leaves UTF-8 letters raw ("...signé_fichiers"), and some versions escape
+    with the ANSI code page (%C9 for É). Guessing one spelling is always wrong
+    for some document, so every candidate is returned and the caller compares.
 #>
-function ConvertFrom-PdfToWordLinkSegment {
+function Get-PdfToWordLinkSegmentCandidate {
     param([string]$Segment)
 
     $decoded = $Segment
     try { $decoded = [Net.WebUtility]::HtmlDecode($decoded) } catch { }
-    try { $decoded = [Uri]::UnescapeDataString($decoded) } catch { }
-    return $decoded
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($decoded)
+
+    if ($decoded.IndexOf('%') -ge 0) {
+        try { $candidates.Add([Uri]::UnescapeDataString($decoded)) } catch { }
+
+        # Percent bytes decoded as Windows-1252, for Word builds that encode
+        # characters outside ASCII with the ANSI code page instead of UTF-8.
+        try {
+            $bytes = New-Object System.Collections.Generic.List[byte]
+            for ($i = 0; $i -lt $decoded.Length; $i++) {
+                $ch = $decoded[$i]
+                if ($ch -eq '%' -and ($i + 2) -lt $decoded.Length) {
+                    $value = 0
+                    if ([int]::TryParse($decoded.Substring($i + 1, 2),
+                            [Globalization.NumberStyles]::HexNumber, $null, [ref]$value)) {
+                        $bytes.Add([byte]$value)
+                        $i += 2
+                        continue
+                    }
+                }
+                foreach ($b in [Text.Encoding]::UTF8.GetBytes([string]$ch)) { $bytes.Add($b) }
+            }
+            $candidates.Add([Text.Encoding]::GetEncoding(1252).GetString($bytes.ToArray()))
+        }
+        catch { }
+    }
+
+    return @($candidates | Select-Object -Unique)
 }
 
 <#
     Replaces every path segment of $Html that decodes to $FolderName with $NewName.
-    Works on URL-ish tokens rather than attributes only, so img/v:imagedata src,
-    link href and CSS url(...) are all covered. Separators (/, \, ./, file:///) and
-    everything else are preserved byte for byte.
+    The URLs are read from src/href attributes (quoted or not) and from CSS
+    url(...), so img/v:imagedata/link targets are covered. Reading the whole
+    attribute value is essential: names containing parentheses or apostrophes
+    ("...S3%20(EN)_fichiers", "...l'Etablissement_fichiers") would otherwise be
+    cut in the middle and never match.
 #>
 function Update-PdfToWordHtmlFolderLink {
     param(
@@ -528,33 +566,71 @@ function Update-PdfToWordHtmlFolderLink {
         [Parameter(Mandatory)][string]$NewName
     )
 
-    # Tokens stop at whitespace, quotes, angle brackets, parentheses and '='. The
-    # encoded folder name contains no space, so one link is one token even when the
-    # real folder name does. Quotes delimiting an attribute stay outside the token.
-    $tokenPattern = "[^\s`"'<>()=]+"
+    $patched = Update-PdfToWordHtmlUrlMatches -Html $Html `
+        -Pattern $script:PdfToWordHtmlUrlAttributePattern -FolderName $FolderName -NewName $NewName
+    $patched = Update-PdfToWordHtmlUrlMatches -Html $patched `
+        -Pattern $script:PdfToWordHtmlCssUrlPattern -FolderName $FolderName -NewName $NewName
+    return $patched
+}
+
+<#
+    Shared engine behind Update-PdfToWordHtmlFolderLink: rewrites the path
+    segments of every URL captured by $Pattern, leaving quoting and the rest of
+    the document untouched.
+#>
+function Update-PdfToWordHtmlUrlMatches {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Html,
+        [Parameter(Mandatory)][string]$Pattern,
+        [Parameter(Mandatory)][string]$FolderName,
+        [Parameter(Mandatory)][string]$NewName
+    )
+
     $builder = New-Object System.Text.StringBuilder
     $cursor = 0
+    $replaced = 0
 
-    foreach ($token in [regex]::Matches($Html, $tokenPattern)) {
-        if ($token.Index -lt $cursor) { continue }
-        [void]$builder.Append($Html.Substring($cursor, $token.Index - $cursor))
+    foreach ($match in [regex]::Matches($Html, $Pattern)) {
+        $group = Get-PdfToWordUrlMatchValue -Match $match
+        if (-not $group) { continue }
 
         # Regex.Split keeps the separators, so only even entries are segments.
-        $parts = [regex]::Split($token.Value, '([/\\])')
+        $parts = [regex]::Split($group.Value, '([/\\])')
+        $changed = 0
         for ($i = 0; $i -lt $parts.Count; $i += 2) {
             if (-not $parts[$i]) { continue }
-            $decoded = ConvertFrom-PdfToWordLinkSegment -Segment $parts[$i]
-            if ([string]::Equals($decoded, $FolderName, [StringComparison]::OrdinalIgnoreCase)) {
-                $parts[$i] = $NewName
+            foreach ($candidate in @(Get-PdfToWordLinkSegmentCandidate -Segment $parts[$i])) {
+                if ([string]::Equals($candidate, $FolderName, [StringComparison]::OrdinalIgnoreCase)) {
+                    $parts[$i] = $NewName
+                    $changed++
+                    break
+                }
             }
         }
+        if ($changed -eq 0) { continue }
 
+        [void]$builder.Append($Html.Substring($cursor, $group.Index - $cursor))
         [void]$builder.Append([string]::Join('', $parts))
-        $cursor = $token.Index + $token.Length
+        $cursor = $group.Index + $group.Length
+        $replaced += $changed
     }
+
+    if ($replaced -eq 0) { return $Html }
 
     [void]$builder.Append($Html.Substring($cursor))
     return $builder.ToString()
+}
+
+<#
+    The URL captured by an attribute or CSS pattern, whichever quote style it used.
+#>
+function Get-PdfToWordUrlMatchValue {
+    param($Match)
+
+    foreach ($name in 'dqvalue', 'sqvalue', 'bare') {
+        if ($Match.Groups[$name].Success) { return $Match.Groups[$name] }
+    }
+    return $null
 }
 
 <#
@@ -605,13 +681,14 @@ function Complete-PdfToWordOutput {
 
         $referencedNames = @()
         if ($htmlText) {
-            foreach ($m in [regex]::Matches($htmlText, '(?i)(?:src|href)\s*=\s*["'']?([^"''\s>]+)')) {
+            foreach ($m in [regex]::Matches($htmlText, $script:PdfToWordHtmlUrlAttributePattern)) {
+                $group = Get-PdfToWordUrlMatchValue -Match $m
+                if (-not $group) { continue }
                 # Every segment, so absolute file:/// links and "./" links are read
                 # the same way as plain relative ones.
-                foreach ($segment in [regex]::Split($m.Groups[1].Value, '([/\\])')) {
+                foreach ($segment in [regex]::Split($group.Value, '([/\\])')) {
                     if (-not $segment) { continue }
-                    $decoded = ConvertFrom-PdfToWordLinkSegment -Segment $segment
-                    if ($decoded) { $referencedNames += $decoded }
+                    $referencedNames += @(Get-PdfToWordLinkSegmentCandidate -Segment $segment)
                 }
             }
         }

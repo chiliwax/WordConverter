@@ -23,12 +23,14 @@ from __future__ import annotations
 import argparse
 import collections
 import ctypes
+import html
 import json
 import logging
 import math
 import os
 import platform
 import queue
+import re
 import shutil
 import stat
 import subprocess
@@ -36,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 import weakref
 from dataclasses import dataclass, field, replace
@@ -58,6 +61,9 @@ __all__ = [
     "FORMATS",
     "DEFAULT_IMAGES_FOLDER",
     "default_workers",
+    "repair_html_outputs",
+    "RepairResult",
+    "RepairSummary",
     "main",
 ]
 
@@ -464,6 +470,379 @@ def _relative_to(path: Path, root: Path) -> Path | None:
         if folded_path.startswith(prefix):
             return Path(raw_path[len(prefix):])
         return None
+
+
+# ---------------------------------------------------------------------------
+# HTML output repair (never touches Word)
+# ---------------------------------------------------------------------------
+
+#: Word's companion folder is localized. These suffixes recognize a stale link
+#: even when the name does not start with the output stem (e.g. title-based names).
+_COMPANION_SUFFIXES = (
+    "_files", "_fichiers", "_dateien", "_archivos", "_bestanden", "_arquivos",
+    "_file", "_filer", "_pliki", "_fails", "_tiedostot", "_soubory", "_subory",
+    "_datoteke", "_failid", "_failai", "_dosyalar",
+)
+
+_LINK_SEGMENT = re.compile(r"([/\\])")
+#: Quote-aware so names containing parentheses and apostrophes survive:
+#: src="ARCHER%20...S3%20(EN)_fichiers/image1.png" and src="...l'Etablissement_...".
+_URL_ATTRIBUTE = re.compile(
+    r"""(?is)\b(?:src|href)\s*=\s*"""
+    r"""(?:(?P<dq>")(?P<dqvalue>[^"]*)"|(?P<sq>')(?P<sqvalue>[^']*)'|(?P<bare>[^\s>"']+))"""
+)
+_CSS_URL = re.compile(
+    r"""(?is)\burl\(\s*"""
+    r"""(?:(?P<dq>")(?P<dqvalue>[^"]*)"|(?P<sq>')(?P<sqvalue>[^']*)'|(?P<bare>[^)\s>"']*))"""
+)
+_VALUE_GROUPS = ("dqvalue", "sqvalue", "bare")
+
+
+@dataclass(frozen=True)
+class RepairResult:
+    """What repair_html_outputs() did with one HTML document."""
+
+    path: Path
+    action: str                             # "repaired", "unchanged" or "skipped"
+    renamed_from: str | None = None
+    links_replaced: int = 0
+    detail: str = ""
+
+    @property
+    def changed(self) -> bool:
+        return self.renamed_from is not None or self.links_replaced > 0
+
+
+@dataclass
+class RepairSummary:
+    """Results of one repair_html_outputs() run."""
+
+    results: list[RepairResult] = field(default_factory=list)
+    dry_run: bool = False
+
+    @property
+    def repaired(self) -> list[RepairResult]:
+        return [item for item in self.results if item.action == "repaired"]
+
+    @property
+    def unchanged(self) -> list[RepairResult]:
+        return [item for item in self.results if item.action == "unchanged"]
+
+    @property
+    def skipped(self) -> list[RepairResult]:
+        return [item for item in self.results if item.action == "skipped"]
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+
+def _decode_urlish(text: str) -> list[str]:
+    """Every plausible decoding of one path segment.
+
+    Word mixes encodings in the same URL: it percent-encodes what a URI forbids
+    (space -> %20) but leaves UTF-8 letters raw ("signé"), and some versions
+    percent-encode with the ANSI code page (%C9 for É). Comparing one guessed
+    spelling never works, so all candidates are compared instead.
+    """
+    decoded = html.unescape(text)
+    candidates = [decoded]
+    if "%" in decoded:
+        for encoding in ("utf-8", "cp1252"):
+            try:
+                candidates.append(urllib.parse.unquote(decoded, encoding=encoding,
+                                                       errors="strict"))
+            except UnicodeDecodeError:
+                continue
+
+    unique: list[str] = []
+    for item in candidates:
+        if item not in unique:
+            unique.append(item)
+    return unique
+
+
+def _segment_names(token: str) -> list[str]:
+    """Decoded candidates for every path segment of one URL-ish token."""
+    names: list[str] = []
+    parts = _LINK_SEGMENT.split(token)
+    for index in range(0, len(parts), 2):
+        if parts[index]:
+            names.extend(_decode_urlish(parts[index]))
+    return names
+
+
+def _match_value(match: re.Match[str]) -> tuple[str, int, int] | None:
+    """The URL captured by an attribute/CSS pattern, with its exact span."""
+    for group in _VALUE_GROUPS:
+        value = match.group(group)
+        if value is not None:
+            return value, match.start(group), match.end(group)
+    return None
+
+
+def _referenced_names(text: str) -> list[str]:
+    names: list[str] = []
+    for match in _URL_ATTRIBUTE.finditer(text):
+        found = _match_value(match)
+        if found is not None:
+            names.extend(_segment_names(found[0]))
+    return names
+
+
+def _rewrite_url_matches(text: str, pattern: re.Pattern[str], old_names: set[str],
+                         new_name: str) -> tuple[str, int]:
+    """Rewrite path segments inside the URLs captured by ``pattern``."""
+    folded = {name.casefold() for name in old_names}
+    pieces: list[str] = []
+    cursor = 0
+    replaced = 0
+
+    for match in pattern.finditer(text):
+        found = _match_value(match)
+        if found is None:
+            continue
+        value, start, end = found
+
+        parts = _LINK_SEGMENT.split(value)
+        changed = 0
+        for index in range(0, len(parts), 2):
+            if not parts[index]:
+                continue
+            if any(name.casefold() in folded for name in _decode_urlish(parts[index])):
+                parts[index] = new_name
+                changed += 1
+        if not changed:
+            continue
+
+        pieces.append(text[cursor:start])
+        pieces.append("".join(parts))
+        cursor = end
+        replaced += changed
+
+    if not replaced:
+        return text, 0
+    pieces.append(text[cursor:])
+    return "".join(pieces), replaced
+
+
+def _rewrite_folder_links(text: str, old_names: set[str],
+                          new_name: str) -> tuple[str, int]:
+    """Replace every path segment that decodes to an old name. Returns (html, count)."""
+    text, count = _rewrite_url_matches(text, _URL_ATTRIBUTE, old_names, new_name)
+    text, extra = _rewrite_url_matches(text, _CSS_URL, old_names, new_name)
+    return text, count + extra
+
+
+def _read_html(raw: bytes) -> tuple[str, str, bool]:
+    """(text, encoding, had_bom): Word writes UTF-8, older templates may not."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8", True
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding), encoding, False
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1"), "latin-1", False
+
+
+def _iter_html_files(root: Path, recursive: bool,
+                     images_folder: str) -> list[Path]:
+    """List .html/.htm documents, skipping the companion folder's own files."""
+    found: list[Path] = []
+    skip = images_folder.casefold()
+
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(_fs_path(root)):
+            dirnames[:] = [name for name in dirnames
+                           if name.casefold() != skip]
+            for name in filenames:
+                if name.startswith("~$"):
+                    continue
+                if name.lower().endswith((".html", ".htm")):
+                    found.append(Path(_strip_long_prefix(os.path.join(dirpath, name))))
+    else:
+        try:
+            with os.scandir(_fs_path(root)) as entries:
+                for entry in entries:
+                    if entry.is_file() and not entry.name.startswith("~$") \
+                            and entry.name.lower().endswith((".html", ".htm")):
+                        found.append(Path(_strip_long_prefix(entry.path)))
+        except OSError:
+            return []
+
+    return sorted(found, key=lambda item: str(item).lower())
+
+
+def _merge_directory(source: Path, destination: Path,
+                     *, dry_run: bool) -> tuple[int, int]:
+    """Move files into destination without overwriting. Returns (moved, left)."""
+    moved = left = 0
+    try:
+        entries = list(os.scandir(_fs_path(source)))
+    except OSError:
+        return 0, 0
+
+    for entry in entries:
+        target = destination / entry.name
+        if _exists(target):
+            left += 1
+            continue
+        if not dry_run:
+            _move_path(source / entry.name, target)
+        moved += 1
+
+    if not dry_run:
+        try:
+            os.rmdir(_fs_path(source))
+        except OSError:
+            pass
+    return moved, left
+
+
+def _repair_one(path: Path, images_folder: str, *, dry_run: bool) -> RepairResult:
+    parent = path.parent
+    stem = path.stem
+    target = parent / images_folder
+
+    try:
+        with open(_fs_path(path), "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return RepairResult(path, "skipped", detail=f"cannot read: {exc}")
+
+    text, encoding, had_bom = _read_html(raw)
+    referenced = _referenced_names(text)
+
+    try:
+        with os.scandir(_fs_path(parent)) as entries:
+            dirs = [entry.name for entry in entries
+                    if entry.is_dir()
+                    and entry.name.casefold() != images_folder.casefold()]
+    except OSError as exc:
+        return RepairResult(path, "skipped", detail=f"cannot list folder: {exc}")
+
+    # 1. The companion folder Word created. Prefer one the page actually
+    #    references, then the usual "<stem>_files" naming.
+    old_dir_name: str | None = None
+    folded_dirs = {name.casefold(): name for name in dirs}
+    for name in referenced:
+        actual = folded_dirs.get(name.casefold())
+        if actual is not None:
+            old_dir_name = actual
+            break
+    if old_dir_name is None and not _is_dir(target):
+        # Only when there is nothing to point at yet: a leftover folder next to
+        # an existing images folder is not the page's companion anymore.
+        prefixed = [name for name in dirs
+                    if name.casefold().startswith((stem + "_").casefold())]
+        if len(prefixed) == 1:
+            old_dir_name = prefixed[0]
+
+    # 2. Names to rewrite. Stale links matter when the folder was already
+    #    renamed to images_folder by a previous, partially failed run.
+    old_names: set[str] = set()
+    if old_dir_name:
+        old_names.add(old_dir_name)
+    if _is_dir(target):
+        for name in referenced:
+            folded = name.casefold()
+            if folded == images_folder.casefold() or folded in folded_dirs:
+                continue
+            if folded.startswith((stem + "_").casefold()) or folded.endswith(
+                    _COMPANION_SUFFIXES):
+                old_names.add(name)
+
+    details: list[str] = []
+    renamed_from: str | None = None
+
+    # 3. Bring the folder to its final name, merging instead of destroying.
+    if old_dir_name is not None:
+        old_path = parent / old_dir_name
+        if _is_dir(target):
+            moved, left = _merge_directory(old_path, target, dry_run=dry_run)
+            details.append(f"merged {moved} file(s) from {old_dir_name}")
+            if left:
+                details.append(f"{left} file(s) kept in {old_dir_name}")
+        else:
+            if not dry_run:
+                _move_path(old_path, target)
+            details.append(f"{old_dir_name} -> {images_folder}")
+        renamed_from = old_dir_name
+
+    # 4. Rewrite the page, whatever encoding Word used for the name.
+    patched, replaced = _rewrite_folder_links(text, old_names, images_folder)
+    if replaced:
+        details.append(f"{replaced} link(s) rewritten")
+        if not dry_run:
+            data = patched.encode(encoding, errors="strict")
+            if had_bom:
+                data = b"\xef\xbb\xbf" + data
+            with open(_fs_path(path), "wb") as handle:
+                handle.write(data)
+
+    if renamed_from is not None or replaced:
+        return RepairResult(path, "repaired", renamed_from, replaced,
+                            ", ".join(details))
+    if not _is_dir(target):
+        return RepairResult(path, "skipped",
+                            detail=f"no Word image folder and no {images_folder}/")
+    return RepairResult(path, "unchanged")
+
+
+def repair_html_outputs(
+    root: str | os.PathLike[str],
+    *,
+    images_folder: str = DEFAULT_IMAGES_FOLDER,
+    recursive: bool = True,
+    dry_run: bool = False,
+    on_result: Callable[[RepairResult], None] | None = None,
+) -> RepairSummary:
+    """Repair already-converted Word HTML output, without running Word.
+
+    Two failures are fixed, idempotently:
+
+    * the companion folder is still named ``<stem>_files`` / ``_fichiers`` /
+      ... and is renamed to ``images_folder``;
+    * the page still points at the old folder name, including when the folder
+      was already renamed and only the HTML text is stale.
+
+    Links are matched by decoding every path segment (percent-encoding in UTF-8
+    or CP1252, HTML entities), so Word's mixed encoding such as
+    ``Mesure%20applicative_FR_signé_fichiers`` is handled. ``dry_run=True``
+    reports what would change without writing anything.
+
+    ``root`` may be one .html file or a folder (searched recursively by default).
+    Nothing is ever deleted; if both folders exist they are merged and same-name
+    files stay in place.
+    """
+    if not images_folder or "/" in images_folder or "\\" in images_folder \
+            or images_folder in (".", ".."):
+        raise ValidationError(f"Invalid images_folder {images_folder!r}.")
+
+    start = _absolute(root)
+    if _is_file(start):
+        if start.suffix.lower() not in (".html", ".htm"):
+            raise ValidationError(f"Not an HTML file: {start}")
+        files = [start]
+    elif _is_dir(start):
+        files = _iter_html_files(start, recursive, images_folder)
+    else:
+        raise ValidationError(f"Folder not found: {start}")
+
+    summary = RepairSummary(dry_run=dry_run)
+    for path in files:
+        try:
+            result = _repair_one(path, images_folder, dry_run=dry_run)
+        except OSError as exc:              # pragma: no cover - defensive
+            result = RepairResult(path, "skipped", detail=str(exc))
+        summary.results.append(result)
+        if on_result is not None:
+            on_result(result)
+    return summary
+
 
 
 # ---------------------------------------------------------------------------

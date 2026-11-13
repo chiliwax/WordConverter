@@ -145,6 +145,53 @@ Describe 'Complete-PdfToWordOutput HTML companion folders' {
         finally { Remove-TestDir $dir }
     }
 
+    It 'renames a folder whose name contains parentheses' {
+        $dir = New-TestDir
+        try {
+            $stem = 'ARCHER DESIGN PATTERNS AWS S3 (EN)'
+            $folder = $stem + '_fichiers'
+            $test = New-HtmlWithImages -Directory $dir -Stem $stem -FolderName $folder
+            New-TestImage -Path (Join-Path $test.Images 'image001.png') -Format Png
+
+            # Word leaves the parentheses raw and encodes only the spaces.
+            $encoded = 'ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers'
+            $html = [IO.File]::ReadAllText($test.Html).Replace($folder, $encoded)
+            [IO.File]::WriteAllText($test.Html, $html, (New-Object Text.UTF8Encoding($false)))
+
+            Complete-PdfToWordOutput -Spec $script:PdfToWordFormats['html'] `
+                -OutputPath $test.Html -ImagesFolderName 'source_folder' -ImageFormat png -Force
+
+            (Test-Path (Join-Path $dir 'source_folder\image001.png')) | Should Be $true
+            $patched = [IO.File]::ReadAllText($test.Html)
+            $patched | Should Match 'source_folder/image001\.png'
+            $patched | Should Not Match ([regex]::Escape($encoded))
+        }
+        finally { Remove-TestDir $dir }
+    }
+
+    It 'renames a folder whose name contains an apostrophe' {
+        $dir = New-TestDir
+        try {
+            $stem = "CAM0036-V2-Origine de l'Etablissement"
+            $folder = $stem + '_fichiers'
+            $test = New-HtmlWithImages -Directory $dir -Stem $stem -FolderName $folder
+            New-TestImage -Path (Join-Path $test.Images 'image001.png') -Format Png
+
+            $encoded = "CAM0036-V2-Origine%20de%20l'Etablissement_fichiers"
+            $html = [IO.File]::ReadAllText($test.Html).Replace($folder, $encoded)
+            [IO.File]::WriteAllText($test.Html, $html, (New-Object Text.UTF8Encoding($false)))
+
+            Complete-PdfToWordOutput -Spec $script:PdfToWordFormats['html'] `
+                -OutputPath $test.Html -ImagesFolderName 'source_folder' -ImageFormat png -Force
+
+            (Test-Path (Join-Path $dir 'source_folder\image001.png')) | Should Be $true
+            $patched = [IO.File]::ReadAllText($test.Html)
+            $patched | Should Match 'source_folder/image001\.png'
+            $patched | Should Not Match ([regex]::Escape($encoded))
+        }
+        finally { Remove-TestDir $dir }
+    }
+
     It 'does not touch a stale folder older than -Since' {
         $dir = New-TestDir
         try {
