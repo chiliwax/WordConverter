@@ -96,6 +96,55 @@ Describe 'Complete-PdfToWordOutput HTML companion folders' {
         finally { Remove-TestDir $dir }
     }
 
+    It 'renames a folder whose link mixes an encoded space and a raw accented letter' {
+        $dir = New-TestDir
+        try {
+            $accented = [char]0xE9
+            $stem = "Mesure applicative_FR_sign${accented}"
+            $folder = "${stem}_fichiers"
+            $test = New-HtmlWithImages -Directory $dir -Stem $stem -FolderName $folder
+            New-TestImage -Path (Join-Path $test.Images 'image001.png') -Format Png
+
+            # Exactly what Word wrote for the reported document: the space is
+            # percent-encoded, the accented letter is left raw.
+            $encoded = 'Mesure%20applicative_FR_sign' + $accented + '_fichiers'
+            $html = [IO.File]::ReadAllText($test.Html).Replace($folder, $encoded)
+            [IO.File]::WriteAllText($test.Html, $html, (New-Object Text.UTF8Encoding($false)))
+
+            Complete-PdfToWordOutput -Spec $script:PdfToWordFormats['html'] `
+                -OutputPath $test.Html -ImagesFolderName 'source_folder' -ImageFormat png -Force
+
+            (Test-Path (Join-Path $dir 'source_folder\image001.png')) | Should Be $true
+            $patched = [IO.File]::ReadAllText($test.Html)
+            $patched | Should Match 'source_folder/image001\.png'
+            $patched | Should Not Match ([regex]::Escape($encoded))
+        }
+        finally { Remove-TestDir $dir }
+    }
+
+    It 'renames a folder whose name is HTML-escaped in the link' {
+        $dir = New-TestDir
+        try {
+            $test = New-HtmlWithImages -Directory $dir -Stem 'A & B' -FolderName 'A & B_files'
+            New-TestImage -Path (Join-Path $test.Images 'image001.png') -Format Png
+
+            # "A & B_files" as Word may serialize it in an attribute: %20 for the
+            # spaces, &amp; for the ampersand.
+            $encoded = 'A%20&amp;%20B_files'
+            $html = [IO.File]::ReadAllText($test.Html).Replace('A & B_files', $encoded)
+            [IO.File]::WriteAllText($test.Html, $html, (New-Object Text.UTF8Encoding($false)))
+
+            Complete-PdfToWordOutput -Spec $script:PdfToWordFormats['html'] `
+                -OutputPath $test.Html -ImagesFolderName 'source_folder' -ImageFormat png -Force
+
+            (Test-Path (Join-Path $dir 'source_folder\image001.png')) | Should Be $true
+            $patched = [IO.File]::ReadAllText($test.Html)
+            $patched | Should Match 'source_folder/image001\.png'
+            $patched | Should Not Match ([regex]::Escape($encoded))
+        }
+        finally { Remove-TestDir $dir }
+    }
+
     It 'does not touch a stale folder older than -Since' {
         $dir = New-TestDir
         try {

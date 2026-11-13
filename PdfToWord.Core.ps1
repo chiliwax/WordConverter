@@ -498,6 +498,65 @@ function Resolve-PdfToWordJob {
 }
 
 # ---------- HTML post-processing ----------
+
+<#
+    Word does not use one encoding for its companion folder inside the HTML: it
+    percent-encodes what a URI forbids (space -> %20) but leaves UTF-8 letters raw
+    ("...signé_fichiers"), and it HTML-escapes &, ' and " in attribute values. The
+    exact spelling is therefore not predictable, so references are compared after
+    decoding instead of by literal string replacement.
+#>
+function ConvertFrom-PdfToWordLinkSegment {
+    param([string]$Segment)
+
+    $decoded = $Segment
+    try { $decoded = [Net.WebUtility]::HtmlDecode($decoded) } catch { }
+    try { $decoded = [Uri]::UnescapeDataString($decoded) } catch { }
+    return $decoded
+}
+
+<#
+    Replaces every path segment of $Html that decodes to $FolderName with $NewName.
+    Works on URL-ish tokens rather than attributes only, so img/v:imagedata src,
+    link href and CSS url(...) are all covered. Separators (/, \, ./, file:///) and
+    everything else are preserved byte for byte.
+#>
+function Update-PdfToWordHtmlFolderLink {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Html,
+        [Parameter(Mandatory)][string]$FolderName,
+        [Parameter(Mandatory)][string]$NewName
+    )
+
+    # Tokens stop at whitespace, quotes, angle brackets, parentheses and '='. The
+    # encoded folder name contains no space, so one link is one token even when the
+    # real folder name does. Quotes delimiting an attribute stay outside the token.
+    $tokenPattern = "[^\s`"'<>()=]+"
+    $builder = New-Object System.Text.StringBuilder
+    $cursor = 0
+
+    foreach ($token in [regex]::Matches($Html, $tokenPattern)) {
+        if ($token.Index -lt $cursor) { continue }
+        [void]$builder.Append($Html.Substring($cursor, $token.Index - $cursor))
+
+        # Regex.Split keeps the separators, so only even entries are segments.
+        $parts = [regex]::Split($token.Value, '([/\\])')
+        for ($i = 0; $i -lt $parts.Count; $i += 2) {
+            if (-not $parts[$i]) { continue }
+            $decoded = ConvertFrom-PdfToWordLinkSegment -Segment $parts[$i]
+            if ([string]::Equals($decoded, $FolderName, [StringComparison]::OrdinalIgnoreCase)) {
+                $parts[$i] = $NewName
+            }
+        }
+
+        [void]$builder.Append([string]::Join('', $parts))
+        $cursor = $token.Index + $token.Length
+    }
+
+    [void]$builder.Append($Html.Substring($cursor))
+    return $builder.ToString()
+}
+
 <#
     Renames Word's "<stem>_files" folder to ImagesFolderName, repairs the links, and
     (for ImageFormat png) converts every non-PNG image in that folder. Safe to call for
@@ -526,9 +585,9 @@ function Complete-PdfToWordOutput {
     $targetFolder = Join-Path $outDir $ImagesFolderName
 
     # Word's HTML companion folder is localized: English "<stem>_files", French
-    # "<stem>_fichiers", German "<stem>_Dateien", ... It is also URL-encoded in the
-    # HTML when the name has spaces. Find it by what the HTML references, then by
-    # the "<stem>_" prefix, rather than assuming an English suffix.
+    # "<stem>_fichiers", German "<stem>_Dateien", ... It is also encoded in the
+    # HTML when the name has spaces or accents. Find it by what the HTML
+    # references, then by the "<stem>_" prefix, rather than assuming a suffix.
     $htmlText = $null
     if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
         $htmlText = [IO.File]::ReadAllText($OutputPath, [Text.Encoding]::UTF8)
@@ -547,11 +606,12 @@ function Complete-PdfToWordOutput {
         $referencedNames = @()
         if ($htmlText) {
             foreach ($m in [regex]::Matches($htmlText, '(?i)(?:src|href)\s*=\s*["'']?([^"''\s>]+)')) {
-                $url = $m.Groups[1].Value
-                $segment = ($url -split '[\\/]')[0]
-                if ($segment) {
-                    try { $referencedNames += [Uri]::UnescapeDataString($segment) }
-                    catch { $referencedNames += $segment }
+                # Every segment, so absolute file:/// links and "./" links are read
+                # the same way as plain relative ones.
+                foreach ($segment in [regex]::Split($m.Groups[1].Value, '([/\\])')) {
+                    if (-not $segment) { continue }
+                    $decoded = ConvertFrom-PdfToWordLinkSegment -Segment $segment
+                    if ($decoded) { $referencedNames += $decoded }
                 }
             }
         }
@@ -592,22 +652,24 @@ function Complete-PdfToWordOutput {
 
         Move-Item -LiteralPath $wordFolder.FullName -Destination $targetFolder -ErrorAction Stop
 
-        # Patch every form the encoder may have produced for the actual (localized)
-        # folder name, not just the English "<stem>_files".
+        # Patch the links by decoding each path segment and comparing it to the real
+        # folder name. Word mixes encodings ("Mesure%20...signé_fichiers"): the space
+        # is escaped, the accented letter is not, so guessing spellings is hopeless.
         if ($htmlText) {
-            $patched = $htmlText
-            $folderCandidates = @(
-                $wordFolderName
-                [Uri]::EscapeDataString($wordFolderName)
-                [Uri]::EscapeUriString($wordFolderName)
-            ) | Select-Object -Unique
-            foreach ($candidate in $folderCandidates) {
-                if ($candidate -and $candidate -ne $ImagesFolderName) {
-                    $patched = $patched.Replace($candidate, $ImagesFolderName)
-                }
-            }
-            if ($patched -ne $htmlText) {
+            $patched = Update-PdfToWordHtmlFolderLink -Html $htmlText `
+                -FolderName $wordFolderName -NewName $ImagesFolderName
+            if ($patched -cne $htmlText) {
                 [IO.File]::WriteAllText($OutputPath, $patched, (New-Object Text.UTF8Encoding($false)))
+            }
+
+            # The rewrite is idempotent: anything a second pass would still change
+            # was missed, and the page would keep using the old folder name. Warn
+            # instead of reporting a success whose images are broken.
+            $recheck = Update-PdfToWordHtmlFolderLink -Html $patched `
+                -FolderName $wordFolderName -NewName $ImagesFolderName
+            if ($recheck -cne $patched) {
+                [Console]::Error.WriteLine(
+                    "pdf2word: warning: '$OutputPath' still references '$wordFolderName'; image links may be broken.")
             }
         }
     }
