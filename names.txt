@@ -1,0 +1,98 @@
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\Cloud\ARCHER DESIGN PATTERNS AWS S3 (EN)\ARCHER DESIGN PATTERNS AWS S3 (EN).html
+  53,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers/image001.png"
+  73,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers/image002.png"></p>
+  84,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers/image003.png"></p>
+  92,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers/image004.png"></p>
+  104,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers/image005.png"></p>
+  108,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(EN)_fichiers/image006.png"></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\Cloud\ARCHER DESIGN PATTERNS AWS S3 (FR)\ARCHER DESIGN PATTERNS AWS S3 (FR).html
+  53,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(FR)_fichiers/image001.png"
+  73,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(FR)_fichiers/image002.png"></p>
+  84,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(FR)_fichiers/image003.png"></p>
+  92,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(FR)_fichiers/image004.png"></p>
+  104,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(FR)_fichiers/image005.png"></p>
+  108,1: src="ARCHER%20DESIGN%20PATTERNS%20AWS%20S3%20(FR)_fichiers/image006.png"></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\Cloud\CLOUD ASSET INVENTORY (EN)\CLOUD ASSET INVENTORY (EN).html
+  112,12: height=542 src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image001.png"
+  114,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image002.png" align=left
+  180,5:     src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image003.png"></p>
+  187,15:     height=38 src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image004.png"
+  258,3:   src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image005.png"></p>
+  265,3:   src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image006.png"><span
+  370,3:   src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image007.png"></td>
+  393,12: height=216 src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image008.png"></span><span
+  438,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image009.png" align=left
+  454,3:   src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image010.png"><span
+  672,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image011.png"></span><span
+  797,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image012.png"></span>                                                                                                                                                  <span
+  829,12: height=436 src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image013.png"></p>
+  834,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image012.png"></span>                                                                                                                                                  <span
+  928,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image014.png"></p>
+  965,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image012.png"></span><b><span
+  1047,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image015.png"></p>
+  1052,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image012.png"></span>                                                                                                                                                  <span
+  1068,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image016.png"></p>
+  1117,5:     src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image017.png"></p>
+  1128,5:     src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image017.png"></p>
+  1139,5:     src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image017.png"></p>
+  1150,5:     src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image017.png"></p>
+  1266,5:     src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image017.png"></p>
+  1315,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image018.png"></span>                                                                                                                                                          <span
+  1329,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image019.png"></span><span
+  1472,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image020.png" align=left
+  1485,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image018.png"></span>                                                                                                                                                          <span
+  1498,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image021.png"></span><span
+  1571,3:   src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image022.png"></p>
+  1610,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image023.png"></span>                                                                                                                                                          <span
+  1622,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image024.png"></span><span
+  1902,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image025.png"></span><span
+  1915,1: src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image026.png"></p>
+  1955,3:   src="CLOUD%20ASSET%20INVENTORY%20(EN)_fichiers/image027.png"></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0036-V2-Origine de l'Etablissement\CAM0036-V2-Origine de l'Etablissement.html
+  141,1: src="CAM0036-V2-Origine%20de%20l'Etablissement_fichiers/image001.png"></span><span
+  169,1: src="CAM0036-V2-Origine%20de%20l'Etablissement_fichiers/image002.png"></span></p>
+  876,1: src="CAM0036-V2-Origine%20de%20l'Etablissement_fichiers/image003.png"></span></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0039-V4-Tranche d'Effectif Salarié\CAM0039-V4-Tranche d'Effectif Salarié.html
+  121,1: src="CAM0039-V4-Tranche%20d'Effectif%20Salarié_fichiers/image001.png"></span> </p>
+  147,1: src="CAM0039-V4-Tranche%20d'Effectif%20Salarié_fichiers/image002.png"></span></p>
+  844,1: src="CAM0039-V4-Tranche%20d'Effectif%20Salarié_fichiers/image003.png"><span
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0054-V1-Mode d'utilisation du taux\CAM0054-V1-Mode d'utilisation du taux.html
+  154,1: src="CAM0054-V1-Mode%20d'utilisation%20du%20taux_fichiers/image001.png"></span><b><span
+  177,1: src="CAM0054-V1-Mode%20d'utilisation%20du%20taux_fichiers/image002.png"></span></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0056-V1-Source de l'index\CAM0056-V1-Source de l'index.html
+  139,1: src="CAM0056-V1-Source%20de%20l'index_fichiers/image001.png"></span><b><span
+  162,1: src="CAM0056-V1-Source%20de%20l'index_fichiers/image002.png"></span></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0067-V2-Tranches d'âges\CAM0067-V2-Tranches d'âges.html
+  125,1: src="CAM0067-V2-Tranches%20d'âges_fichiers/image001.png"></span><b><span
+  148,1: src="CAM0067-V2-Tranches%20d'âges_fichiers/image002.png"></span></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0070-V1-Relevé d'identité bancaire\CAM0070-V1-Relevé d'identité bancaire.html
+  128,1: src="CAM0070-V1-Relevé%20d'identité%20bancaire_fichiers/image001.png"></span><b><span
+  150,1: src="CAM0070-V1-Relevé%20d'identité%20bancaire_fichiers/image002.png"></span></p>
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0128-V1-Mode d'amortissement Crédit\CAM0128-V1-Mode d'amortissement Crédit.html
+  125,1: src="CAM0128-V1-Mode%20d'amortissement%20Crédit_fichiers/image001.png"></span><b><i> </i></b></p>
+  151,1: src="CAM0128-V1-Mode%20d'amortissement%20Crédit_fichiers/image002.png"></span></p>
+  333,1: src="CAM0128-V1-Mode%20d'amortissement%20Crédit_fichiers/image003.png"></span> M
+  613,1: src="CAM0128-V1-Mode%20d'amortissement%20Crédit_fichiers/image004.png"></span></p>
+  852,1: src="CAM0128-V1-Mode%20d'amortissement%20Crédit_fichiers/image005.png"></span><i>Remboursement
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0129-V1-Type d'échéance Crédit\CAM0129-V1-Type d'échéance Crédit.html
+  125,1: src="CAM0129-V1-Type%20d'échéance%20Crédit_fichiers/image001.png"></span><b><i> </i></b></p>
+  151,1: src="CAM0129-V1-Type%20d'échéance%20Crédit_fichiers/image002.png"></span></p>
+  330,1: src="CAM0129-V1-Type%20d'échéance%20Crédit_fichiers/image003.png"></span> M
+  524,1: src="CAM0129-V1-Type%20d'échéance%20Crédit_fichiers/image004.png"></span><span
+  592,1: src="CAM0129-V1-Type%20d'échéance%20Crédit_fichiers/image005.png"></span></p>
+  834,1: src="CAM0129-V1-Type%20d'échéance%20Crédit_fichiers/image006.png"></span>Echéance
+
+C:\Users\MR855CK\Downloads\LAC - MD transformation\server\tmp\2026-11-13_145353\html\N&N CAM\CAM0180-V1-Zones d'emploi\CAM0180-V1-Zones d'emploi.html
+  118,19: id="Group 283874" src="CAM0180-V1-Zones%20d'emploi_fichiers/image001.png"></span><span
+  160,1: src="CAM0180-V1-Zones%20d'emploi_fichiers/image002.png"></span></p>
+  435,3:   src="CAM0180-V1-Zones%20d'emploi_fichiers/image003.png"></span>Mme  MONSET
